@@ -348,7 +348,6 @@ fn openFromMap(
 
 fn depthErrorMsg(comptime fname: []const u8, e: core_mod.formats.DepthSelectError) [:0]const u8 {
     return switch (e) {
-        error.BadFormatString => fname ++ ": 'format' must be one of auto, u8, u16, f16, f32",
         error.NoFloat8 => fname ++ ": there is no 8-bit float format",
         error.BadBitdepth => fname ++ ": 'bitdepth' must be 8, 16 or 32",
         error.FpRequiresBitdepth => fname ++ ": 'fp' requires 'bitdepth'",
@@ -377,7 +376,6 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
     };
 
     const depth = core_mod.formats.resolveDepth(
-        map_in.getData("format", 0),
         map_in.getInt(i64, "bitdepth"),
         map_in.getBool("fp"),
     ) catch |e| {
@@ -498,7 +496,7 @@ export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI
     );
     ZAPI.Plugin.function(
         "Source",
-        "source:data;bitdepth:int:opt;fp:int:opt;format:data:opt;alpha:int:opt;scale:int:opt;" ++
+        "source:data;bitdepth:int:opt;fp:int:opt;alpha:int:opt;scale:int:opt;" ++
             "kelvin:int:opt;tint:int:opt;exposure:float:opt;iso:int:opt;" ++
             "gamma:data:opt;gamut:data:opt;colorscience:int:opt;" ++
             "highlightrecovery:int:opt;gamutcompression:int:opt;" ++

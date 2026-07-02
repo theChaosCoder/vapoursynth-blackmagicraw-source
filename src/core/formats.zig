@@ -34,35 +34,26 @@ pub const Depth = enum {
 };
 
 pub const DepthSelectError = error{
-    BadFormatString,
     NoFloat8,
     BadBitdepth,
     FpRequiresBitdepth,
 };
 
 /// Resolve the user-facing depth selection (shared by both adapters):
-/// `bitdepth` 8/16/32 with optional `fp` is the primary API, `format`
-/// ("auto"/"u8"/"u16"/"f16"/"f32") the legacy alias; bitdepth wins.
+/// `bitdepth` 8/16/32 with optional `fp` (16+fp = half float).
 /// Returns null for automatic selection.
-pub fn resolveDepth(format_str: ?[]const u8, bitdepth: ?i64, fp: ?bool) DepthSelectError!?Depth {
-    var depth: ?Depth = null;
-    if (format_str) |s| {
-        if (!std.ascii.eqlIgnoreCase(s, "auto")) {
-            depth = Depth.parse(s) orelse return error.BadFormatString;
-        }
-    }
+pub fn resolveDepth(bitdepth: ?i64, fp: ?bool) DepthSelectError!?Depth {
     if (bitdepth) |b| {
         const want_fp = fp orelse false;
-        depth = switch (b) {
-            8 => if (want_fp) return error.NoFloat8 else .u8_,
+        return switch (b) {
+            8 => if (want_fp) error.NoFloat8 else .u8_,
             16 => if (want_fp) .f16 else .u16_,
             32 => .f32_,
-            else => return error.BadBitdepth,
+            else => error.BadBitdepth,
         };
-    } else if (fp != null) {
-        return error.FpRequiresBitdepth;
     }
-    return depth;
+    if (fp != null) return error.FpRequiresBitdepth;
+    return null;
 }
 
 /// Pick the SDK resource format for a depth/alpha combination.
@@ -201,18 +192,16 @@ fn testDest(comptime T: type, w: u32, h: u32, bufs: *[4][]T, want_alpha: bool) D
     return d;
 }
 
-test "resolveDepth: bitdepth wins, errors on bad input" {
-    try std.testing.expectEqual(@as(?Depth, null), try resolveDepth(null, null, null));
-    try std.testing.expectEqual(@as(?Depth, null), try resolveDepth("auto", null, null));
-    try std.testing.expectEqual(@as(?Depth, .f32_), try resolveDepth(null, 32, null));
-    try std.testing.expectEqual(@as(?Depth, .f16), try resolveDepth(null, 16, true));
-    try std.testing.expectEqual(@as(?Depth, .u8_), try resolveDepth(null, 8, false));
-    try std.testing.expectEqual(@as(?Depth, .u16_), try resolveDepth("f32", 16, null)); // bitdepth wins
-    try std.testing.expectEqual(@as(?Depth, .f32_), try resolveDepth("f32", null, null));
-    try std.testing.expectError(error.NoFloat8, resolveDepth(null, 8, true));
-    try std.testing.expectError(error.BadBitdepth, resolveDepth(null, 12, null));
-    try std.testing.expectError(error.FpRequiresBitdepth, resolveDepth(null, null, true));
-    try std.testing.expectError(error.BadFormatString, resolveDepth("yuv", null, null));
+test "resolveDepth: mappings and errors" {
+    try std.testing.expectEqual(@as(?Depth, null), try resolveDepth(null, null));
+    try std.testing.expectEqual(@as(?Depth, .u8_), try resolveDepth(8, null));
+    try std.testing.expectEqual(@as(?Depth, .u16_), try resolveDepth(16, null));
+    try std.testing.expectEqual(@as(?Depth, .f16), try resolveDepth(16, true));
+    try std.testing.expectEqual(@as(?Depth, .f32_), try resolveDepth(32, null));
+    try std.testing.expectEqual(@as(?Depth, .f32_), try resolveDepth(32, true));
+    try std.testing.expectError(error.NoFloat8, resolveDepth(8, true));
+    try std.testing.expectError(error.BadBitdepth, resolveDepth(12, null));
+    try std.testing.expectError(error.FpRequiresBitdepth, resolveDepth(null, true));
 }
 
 test "planar u16 copy respects stride" {

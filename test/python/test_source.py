@@ -103,12 +103,20 @@ def test_portrait_ntsc_and_random_access():
 
 
 def test_formats_and_alpha():
-    # bitdepth is the primary user-facing selector
-    check(open_clip(SDK_SAMPLE, bitdepth=8).format.id == vs.RGB24, "bitdepth=8 -> RGB24")
-    check(open_clip(SDK_SAMPLE, bitdepth=32).format.id == vs.RGBS, "bitdepth=32 -> RGBS")
+    # bitdepth selects the output depth (each variant must also decode)
+    clip8 = open_clip(SDK_SAMPLE, bitdepth=8)
+    check(clip8.format.id == vs.RGB24, "bitdepth=8 -> RGB24")
+    clip8.get_frame(0)
+
     check(open_clip(SDK_SAMPLE, bitdepth=16).format.id == vs.RGB48, "bitdepth=16 -> RGB48")
-    check(open_clip(SDK_SAMPLE, bitdepth=16, fp=True).format.id == vs.RGBH,
-          "bitdepth=16 fp -> RGBH")
+
+    clipf = open_clip(SDK_SAMPLE, bitdepth=32)
+    check(clipf.format.id == vs.RGBS, "bitdepth=32 -> RGBS")
+    clipf.get_frame(0)
+
+    cliph = open_clip(SDK_SAMPLE, bitdepth=16, fp=True)
+    check(cliph.format.id == vs.RGBH, "bitdepth=16 fp -> RGBH")
+    cliph.get_frame(0)
 
     # automatic: 16-bit int normally, 32-bit float for Linear gamma
     check(open_clip(SDK_SAMPLE).format.id == vs.RGB48, "auto -> RGB48")
@@ -123,18 +131,6 @@ def test_formats_and_alpha():
         except vs.Error:
             global passed
             passed += 1
-
-    clip8 = open_clip(SDK_SAMPLE, format="u8")
-    check(clip8.format.id == vs.RGB24, "u8 -> RGB24")
-    clip8.get_frame(0)
-
-    clipf = open_clip(SDK_SAMPLE, format="f32")
-    check(clipf.format.id == vs.RGBS, "f32 -> RGBS")
-    clipf.get_frame(0)
-
-    cliph = open_clip(SDK_SAMPLE, format="f16")
-    check(cliph.format.id == vs.RGBH, "f16 -> RGBH")
-    cliph.get_frame(0)
 
     clipa = open_clip(SDK_SAMPLE, alpha=True)
     fa = clipa.get_frame(0)
@@ -175,19 +171,19 @@ def test_oracle_byte_exact():
 
     # u16: SDK planar buffer == plugin planes concatenated
     ref = dump("u16")
-    f = open_clip(SDK_SAMPLE, format="u16").get_frame(0)
+    f = open_clip(SDK_SAMPLE, bitdepth=16).get_frame(0)
     got = b"".join(bytes(f[p]) for p in range(3))
     check(got == ref, "u16 planar byte-exact vs oracle")
 
     # f32: same, planar float
     ref = dump("f32")
-    f = open_clip(SDK_SAMPLE, format="f32").get_frame(0)
+    f = open_clip(SDK_SAMPLE, bitdepth=32).get_frame(0)
     got = b"".join(bytes(f[p]) for p in range(3))
     check(got == ref, "f32 planar byte-exact vs oracle")
 
     # u8: SDK interleaved RGBA -> per-channel stride slicing
     ref = dump("u8")
-    f = open_clip(SDK_SAMPLE, format="u8").get_frame(0)
+    f = open_clip(SDK_SAMPLE, bitdepth=8).get_frame(0)
     for p in range(3):
         check(bytes(f[p]) == ref[p::4], f"u8 deinterleave plane {p} byte-exact")
     check(set(ref[3::4]) == {255}, "SDK alpha channel is constant opaque")

@@ -257,29 +257,28 @@ fn freeFilter(fi_opt: [*c]FI) callconv(cc) void {
 
 // arg indices per the registration string below
 const arg_source = 0;
-const arg_format = 1;
-const arg_alpha = 2;
-const arg_audio = 3;
-const arg_scale = 4;
-const arg_kelvin = 5;
-const arg_tint = 6;
-const arg_exposure = 7;
-const arg_iso = 8;
-const arg_gamma = 9;
-const arg_gamut = 10;
-const arg_colorscience = 11;
-const arg_highlightrecovery = 12;
-const arg_gamutcompression = 13;
-const arg_allmetaprops = 14;
-const arg_threads = 15;
-const arg_libpath = 16;
-const arg_bitdepth = 17;
-const arg_fp = 18;
+const arg_bitdepth = 1;
+const arg_fp = 2;
+const arg_alpha = 3;
+const arg_audio = 4;
+const arg_scale = 5;
+const arg_kelvin = 6;
+const arg_tint = 7;
+const arg_exposure = 8;
+const arg_iso = 9;
+const arg_gamma = 10;
+const arg_gamut = 11;
+const arg_colorscience = 12;
+const arg_highlightrecovery = 13;
+const arg_gamutcompression = 14;
+const arg_allmetaprops = 15;
+const arg_threads = 16;
+const arg_libpath = 17;
 
 const params_string =
-    "s[format]s[alpha]b[audio]b[scale]i[kelvin]i[tint]i[exposure]f[iso]i" ++
+    "s[bitdepth]i[fp]b[alpha]b[audio]b[scale]i[kelvin]i[tint]i[exposure]f[iso]i" ++
     "[gamma]s[gamut]s[colorscience]i[highlightrecovery]b[gamutcompression]b" ++
-    "[allmetaprops]b[threads]i[libpath]s[bitdepth]i[fp]b";
+    "[allmetaprops]b[threads]i[libpath]s";
 
 export fn bsrc_create_impl(env: ?*Env, args: *const Val, out: *Val, user_data: ?*anyopaque) void {
     _ = user_data;
@@ -290,12 +289,10 @@ export fn bsrc_create_impl(env: ?*Env, args: *const Val, out: *Val, user_data: ?
     };
 
     const depth = core_mod.formats.resolveDepth(
-        asStr(argAt(args, arg_format)),
         asInt(argAt(args, arg_bitdepth)),
         asBool(argAt(args, arg_fp)),
     ) catch |e| {
         setErrorVal(env, out, switch (e) {
-            error.BadFormatString => "BRAWSource: format must be one of auto, u8, u16, f32",
             error.NoFloat8 => "BRAWSource: there is no 8-bit float format",
             error.BadBitdepth => "BRAWSource: bitdepth must be 8, 16 or 32",
             error.FpRequiresBitdepth => "BRAWSource: fp requires bitdepth",
