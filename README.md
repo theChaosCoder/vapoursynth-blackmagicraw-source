@@ -11,10 +11,12 @@ Frame-exact random access, audio, frame properties from clip/frame metadata.
 
 ## Runtime
 
-The plugin loads the Blackmagic RAW runtime at run time. Easiest setup: put
-the runtime libraries (`BlackmagicRawAPI` + sibling decoder libs) into a
-folder next to the plugin named **`blackmagic_win_deps`** /
-**`blackmagic_linux_deps`** / **`blackmagic_mac_deps`**. Alternatively an
+The plugin loads the Blackmagic RAW runtime at run time. **The release zips
+are batteries-included**: they ship the runtime in a
+**`blackmagic_win_deps`** / **`blackmagic_linux_deps`** /
+**`blackmagic_mac_deps`** folder next to the plugin — extract into your
+plugin directory and you're done. For custom setups the same folder
+convention works with your own copy of the runtime; alternatively an
 installed Blackmagic RAW / DaVinci Resolve is found automatically, or use
 the `libpath` parameter / `BRAW_LIBRARY` env var.
 
