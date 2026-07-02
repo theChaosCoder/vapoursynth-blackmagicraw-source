@@ -29,13 +29,25 @@ reused buffer, pinned readback):
 
 The GPU decoder itself is roughly **5× faster**.
 
+Raw decode scales with resolution — at 6K (6048×4032) the CPU falls to
+~53 fps while CUDA holds ~207 fps (**3.9×**).
+
 **In the plugin, via VapourSynth** (`test/bench/bench_vs.py`, real multi-threaded
 frameserver use):
 
-| resolution | CPU fps | CUDA fps | speedup |
+| clip / resolution | CPU fps | CUDA fps | speedup |
 |---|---|---|---|
-| 4608×2592 (full) | 74 | 100 | **1.35×** |
+| 4608×2592 (4.6K, u16) | 74 | 100 | **1.35×** |
 | 2304×1296 (scale=2) | 242 | 209 | 0.86× |
+| 6048×4032 (6K, u16) | 25.8 | 26.2 | **1.02×** |
+
+The 6K row is the clearest illustration: the raw GPU decode is 3.9× faster
+there, yet in the plugin the two pipelines are identical (~26 fps). Each 6K
+frame is 146 MB, so allocating the VapourSynth frame and copying the decoded
+pixels into it dwarfs the decode entirely — and that cost is the same
+whether the decode ran on the CPU or GPU. The bigger the frame, the more the
+copy dominates, so the in-plugin GPU advantage *shrinks* as resolution grows
+even though the raw decode advantage grows.
 
 ## Why the plugin gain is smaller than the raw 5×
 
