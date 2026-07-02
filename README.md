@@ -43,7 +43,7 @@ Parameters (both frameworks):
 | `gamma, gamut, colorscience` | color science overrides (e.g. `gamma="Rec.709"`); invalid values error at open |
 | `highlightrecovery, gamutcompression` | processing toggles |
 | `allmetaprops` | expose every metadata key as `BRAW_<key>` frame prop |
-| `threads` | SDK CPU threads (0 = default) |
+| `threads` | CPU decode threads (`SetCPUThreads`); 0 = all hardware threads. Lower it to leave cores free for downstream filters — the BRAW decoder otherwise saturates every core |
 | `libpath` | Blackmagic RAW library file or directory |
 
 Defaults decode "as shot": camera metadata plus an auto-applied
