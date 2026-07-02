@@ -7,6 +7,8 @@ Frame-exact random access, audio, frame properties from clip/frame metadata.
 - **VapourSynth**: `braw.Source` + `braw.AudioSource` — Linux, Windows, macOS (x64/arm64)
 - **AviSynth+**: `BRAWSource` (video + audio track) — Windows x64
 
+![sample.braw decoded in VS View, frame properties from the clip metadata](doc/brawsource.jpg)
+
 ## Runtime
 
 The plugin loads the Blackmagic RAW runtime at run time. Easiest setup: put
