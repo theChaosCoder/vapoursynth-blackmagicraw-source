@@ -1,8 +1,18 @@
-# CUDA decoding — implementation & benchmark
+# GPU decoding — implementation & benchmark
 
-The `gpu-cuda` branch adds a `pipeline="cuda"` option to `braw.Source` that
-decodes on the GPU via the Blackmagic RAW SDK's CUDA pipeline instead of the
-CPU. Correctness is verified: a CUDA-decoded frame matches the CPU decode to
+The `gpu-cuda` branch adds a `pipeline` option to `braw.Source`:
+`cuda` (NVIDIA, Linux/Windows) and `metal` (Apple GPU, macOS) decode on the
+GPU via the Blackmagic RAW SDK's respective pipelines instead of the CPU.
+
+The benchmark below is for the CUDA path (measured on an RTX 3080). **Metal
+is implemented but untested on real hardware** — the readback goes through a
+Metal blit into a managed staging buffer via the Objective-C runtime
+(`src/core/braw/metal.zig`), mirroring the SDK's ProcessClipMetal sample. On
+Apple Silicon that blit is on-chip (unified memory) rather than over PCIe, so
+the readback is cheaper than on a discrete GPU — the GPU advantage should be
+*less* masked than the CUDA numbers below, but that needs measuring on a Mac.
+
+## CUDA Correctness is verified: a CUDA-decoded frame matches the CPU decode to
 within <0.4 % of the 16-bit range (GPU vs CPU rounding, the same order of
 difference seen between the Linux and Windows CPU builds).
 

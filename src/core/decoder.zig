@@ -16,6 +16,7 @@ const strings = @import("braw/strings.zig");
 const variant = @import("braw/variant.zig");
 const loader = @import("braw/loader.zig");
 const cuda = @import("braw/cuda.zig");
+const metal = @import("braw/metal.zig");
 const formats = @import("formats.zig");
 const meta = @import("meta.zig");
 const sync = @import("sync.zig");
@@ -112,11 +113,13 @@ pub fn clipOverridesFromParams(
 
 pub const Pipeline = enum {
     cpu,
-    cuda,
+    cuda, // NVIDIA (Linux/Windows)
+    metal, // Apple GPU (macOS)
 
     pub fn parse(s: []const u8) ?Pipeline {
         if (std.ascii.eqlIgnoreCase(s, "cpu")) return .cpu;
         if (std.ascii.eqlIgnoreCase(s, "cuda")) return .cuda;
+        if (std.ascii.eqlIgnoreCase(s, "metal")) return .metal;
         return null;
     }
 };
@@ -170,7 +173,7 @@ pub const OpenError = error{
     CodecFailed,
     OpenClipFailed,
     InvalidProcessingAttribute,
-    CudaUnavailable,
+    GpuUnavailable,
     PipelineUnsupported,
     OutOfMemory,
 };
@@ -372,21 +375,28 @@ fn cbProcessComplete(_: *anyopaque, job: *api.IBlackmagicRawJob, hr: api.HRESULT
         return;
     }
 
-    // On the GPU pipeline the resource lives in device memory: read it back
-    // into a pinned host staging buffer (from the pool) before the copy.
+    // On a GPU pipeline the resource lives in device memory: read it back
+    // into a host staging buffer (pooled) before the copy.
     var host_src: [*]const u8 = @ptrCast(resource.?);
     var staging: ?[]u8 = null;
     defer if (staging) |s| req.decoder.releasePinned(s);
-    if (req.decoder.cuda_ctx) |*ctx| {
+    if (req.decoder.cuda_ctx != null or req.decoder.metal_queue != null) {
         const buf = req.decoder.acquirePinned(size_bytes) catch {
             req.oom = true;
             return;
         };
         staging = buf;
-        ctx.readback(buf.ptr, @intFromPtr(resource.?), size_bytes) catch {
-            req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH)");
-            return;
-        };
+        if (req.decoder.cuda_ctx) |*ctx| {
+            ctx.readback(buf.ptr, @intFromPtr(resource.?), size_bytes) catch {
+                req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH)");
+                return;
+            };
+        } else {
+            metal.readback(req.decoder.metal_queue.?, resource.?, buf.ptr, size_bytes) catch {
+                req.fail(api.E_FAIL, "GPU readback (Metal blit)");
+                return;
+            };
+        }
         host_src = buf.ptr;
     }
 
@@ -595,10 +605,14 @@ pub const Decoder = struct {
     submit_mutex: sync.Mutex = .{},
     audio_mutex: sync.Mutex = .{},
 
-    // GPU pipeline: CUDA context + a pool of pinned host staging buffers for
-    // the device->host readback (allocating pinned memory per frame is slow).
+    // GPU pipeline state. CUDA: context + a pool of pinned host staging
+    // buffers for the device->host readback (pinned alloc per frame is slow).
+    // Metal: the SDK pipeline device, whose MTLCommandQueue drives the blit
+    // readback; the staging buffer is Metal-managed inside metal.zig.
     pipeline: Pipeline,
     cuda_ctx: ?cuda.Context = null,
+    metal_device: ?*api.IBlackmagicRawPipelineDevice = null,
+    metal_queue: ?*anyopaque = null,
     pinned_pool: std.ArrayList([]u8) = .empty,
     pinned_mutex: sync.Mutex = .{},
 
@@ -674,6 +688,7 @@ pub const Decoder = struct {
             api.release(self.codec);
         }
         errdefer if (self.cuda_ctx) |*ctx| ctx.destroy();
+        errdefer if (self.metal_device) |d| api.release(d);
 
         // configuration is read at the first OpenClip, so pipeline + threads
         // must be set beforehand
@@ -686,20 +701,26 @@ pub const Decoder = struct {
 
             if (opts.threads > 0) _ = cfg.v.setCPUThreads(cfg, opts.threads);
 
-            if (opts.pipeline == .cuda) {
-                self.cuda_ctx = cuda.Context.create() catch |e| {
-                    err_detail.* = std.fmt.allocPrint(gpa, "CUDA pipeline requested but unavailable: {s}", .{@errorName(e)}) catch null;
-                    return error.CudaUnavailable;
-                };
-                var supported = false;
-                _ = cfg.v.isPipelineSupported(cfg, .cuda, &supported);
-                if (!supported) {
-                    err_detail.* = std.fmt.allocPrint(gpa, "the BlackmagicRaw CUDA decoder is not available (libDecoderCUDA missing?)", .{}) catch null;
-                    return error.PipelineUnsupported;
-                }
-                if (cfg.v.setPipeline(cfg, .cuda, self.cuda_ctx.?.handle, null) != api.S_OK) {
-                    return error.PipelineUnsupported;
-                }
+            switch (opts.pipeline) {
+                .cpu => {},
+                .cuda => {
+                    self.cuda_ctx = cuda.Context.create() catch |e| {
+                        err_detail.* = std.fmt.allocPrint(gpa, "CUDA pipeline requested but unavailable: {s}", .{@errorName(e)}) catch null;
+                        return error.GpuUnavailable;
+                    };
+                    var supported = false;
+                    _ = cfg.v.isPipelineSupported(cfg, .cuda, &supported);
+                    if (!supported) {
+                        err_detail.* = std.fmt.allocPrint(gpa, "the BlackmagicRaw CUDA decoder is not available (libDecoderCUDA missing?)", .{}) catch null;
+                        return error.PipelineUnsupported;
+                    }
+                    if (cfg.v.setPipeline(cfg, .cuda, self.cuda_ctx.?.handle, null) != api.S_OK) {
+                        return error.PipelineUnsupported;
+                    }
+                },
+                .metal => {
+                    try self.setupMetal(cfg, err_detail);
+                },
             }
         }
 
@@ -906,24 +927,71 @@ pub const Decoder = struct {
         };
     }
 
-    // --- pinned host staging pool (GPU readback) ---
+    // --- Metal pipeline setup (macOS) ---
+
+    fn setupMetal(self: *Decoder, cfg: *api.IBlackmagicRawConfiguration, err_detail: *?[]u8) OpenError!void {
+        const gpa = self.gpa;
+        if (!metal.available()) {
+            err_detail.* = std.fmt.allocPrint(gpa, "Metal pipeline requested but the Objective-C/Metal runtime could not be loaded", .{}) catch null;
+            return error.GpuUnavailable; // GPU runtime not loadable
+        }
+        // the SDK creates the Metal device for us (no manual MTLDevice)
+        var iter_opt: ?*api.IBlackmagicRawPipelineDeviceIterator = null;
+        if (self.factory.v.createPipelineDeviceIterator(self.factory, .metal, .none, &iter_opt) != api.S_OK or iter_opt == null) {
+            err_detail.* = std.fmt.allocPrint(gpa, "the BlackmagicRaw Metal decoder is not available on this system", .{}) catch null;
+            return error.PipelineUnsupported;
+        }
+        const iter = iter_opt.?;
+        defer api.release(iter);
+
+        var dev_opt: ?*api.IBlackmagicRawPipelineDevice = null;
+        if (iter.v.createDevice(iter, &dev_opt) != api.S_OK or dev_opt == null) {
+            return error.PipelineUnsupported;
+        }
+        self.metal_device = dev_opt.?;
+
+        if (cfg.v.setFromDevice(cfg, self.metal_device.?) != api.S_OK) {
+            return error.PipelineUnsupported;
+        }
+        // cache the native MTLCommandQueue for the readback path
+        var pl: api.Pipeline = .metal;
+        var ctx_out: ?*anyopaque = null;
+        var queue_out: ?*anyopaque = null;
+        if (self.metal_device.?.v.getPipeline(self.metal_device.?, &pl, &ctx_out, &queue_out) != api.S_OK or queue_out == null) {
+            return error.PipelineUnsupported;
+        }
+        self.metal_queue = queue_out;
+    }
+
+    // --- host staging pool (GPU readback) ---
+    // CUDA uses pinned host memory (faster DtoH); Metal copies into plain
+    // host memory. Either way buffers are pooled since per-frame allocation
+    // is wasteful.
+
+    fn allocStaging(self: *Decoder, size: usize) ![]u8 {
+        if (self.cuda_ctx) |*ctx| return ctx.allocPinned(size) catch error.OutOfMemory;
+        return self.gpa.alloc(u8, size);
+    }
+
+    fn freeStaging(self: *Decoder, buf: []u8) void {
+        if (self.cuda_ctx) |*ctx| ctx.freePinned(buf) else self.gpa.free(buf);
+    }
 
     fn acquirePinned(self: *Decoder, size: u32) ![]u8 {
-        const ctx = &self.cuda_ctx.?;
         self.pinned_mutex.lock();
         defer self.pinned_mutex.unlock();
         while (self.pinned_pool.pop()) |buf| {
             if (buf.len >= size) return buf;
-            ctx.freePinned(buf); // stale (smaller) buffer; drop it
+            self.freeStaging(buf); // stale (smaller) buffer; drop it
         }
-        return ctx.allocPinned(size) catch error.OutOfMemory;
+        return self.allocStaging(size);
     }
 
     fn releasePinned(self: *Decoder, buf: []u8) void {
         self.pinned_mutex.lock();
         defer self.pinned_mutex.unlock();
         self.pinned_pool.append(self.gpa, buf) catch {
-            self.cuda_ctx.?.freePinned(buf);
+            self.freeStaging(buf);
         };
     }
 
@@ -935,12 +1003,15 @@ pub const Decoder = struct {
         if (self.clip_ex) |e| api.release(e);
         api.release(self.clip);
         api.release(self.codec);
-        api.release(self.factory);
-        if (self.cuda_ctx) |*ctx| {
-            for (self.pinned_pool.items) |buf| ctx.freePinned(buf);
+        // drain the staging pool with the right free (pinned vs gpa) before
+        // the CUDA context is destroyed
+        if (self.cuda_ctx != null or self.metal_queue != null) {
+            for (self.pinned_pool.items) |buf| self.freeStaging(buf);
             self.pinned_pool.deinit(gpa);
-            ctx.destroy();
         }
+        if (self.cuda_ctx) |*ctx| ctx.destroy();
+        if (self.metal_device) |d| api.release(d);
+        api.release(self.factory);
         loader.release(self.lib);
         if (self.camera_type.len > 0) gpa.free(self.camera_type);
         self.clip_props.deinit(gpa);

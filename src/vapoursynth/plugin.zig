@@ -418,7 +418,7 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
     var pipeline: core_mod.decoder.Pipeline = .cpu;
     if (map_in.getData("pipeline", 0)) |p| {
         pipeline = core_mod.decoder.Pipeline.parse(p) orelse {
-            map_out.setError("braw.Source: 'pipeline' must be 'cpu' or 'cuda'");
+            map_out.setError("braw.Source: 'pipeline' must be 'cpu', 'cuda' or 'metal'");
             return;
         };
     }

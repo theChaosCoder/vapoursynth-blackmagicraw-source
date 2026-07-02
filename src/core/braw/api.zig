@@ -159,6 +159,12 @@ pub const Pipeline = enum(u32) {
     _,
 };
 
+pub const Interop = enum(u32) {
+    none = 0x6E6F6E65, // 'none'
+    opengl = 0x6F70676C, // 'opgl'
+    _,
+};
+
 pub const AudioFormat = enum(u32) {
     pcm_little_endian = 0x70636D6C, // 'pcml'
     _,
@@ -389,7 +395,7 @@ pub const IBlackmagicRawFactory = extern struct {
         unknown: UnknownVt(),
         createCodec: *const fn (*Self, *?*IBlackmagicRaw) callconv(.c) HRESULT,
         createPipelineIterator: UnusedSlot,
-        createPipelineDeviceIterator: UnusedSlot,
+        createPipelineDeviceIterator: *const fn (*Self, Pipeline, Interop, *?*IBlackmagicRawPipelineDeviceIterator) callconv(.c) HRESULT,
         createClipGeometry: UnusedSlot,
     };
 
@@ -398,6 +404,37 @@ pub const IBlackmagicRawFactory = extern struct {
         if (self.v.createCodec(self, &out) != S_OK) return null;
         return out;
     }
+};
+
+pub const IBlackmagicRawPipelineDeviceIterator = extern struct {
+    v: *const VTable,
+    const Self = @This();
+    pub const VTable = extern struct {
+        unknown: UnknownVt(),
+        next: *const fn (*Self) callconv(.c) HRESULT,
+        getPipeline: *const fn (*Self, *Pipeline) callconv(.c) HRESULT,
+        getInterop: *const fn (*Self, *Interop) callconv(.c) HRESULT,
+        createDevice: *const fn (*Self, *?*IBlackmagicRawPipelineDevice) callconv(.c) HRESULT,
+    };
+};
+
+pub const IBlackmagicRawPipelineDevice = extern struct {
+    v: *const VTable,
+    const Self = @This();
+    pub const VTable = extern struct {
+        unknown: UnknownVt(),
+        setBestInstructionSet: UnusedSlot,
+        setInstructionSet: UnusedSlot,
+        getInstructionSet: UnusedSlot,
+        getIndex: UnusedSlot,
+        getName: *const fn (*Self, *StringRaw) callconv(.c) HRESULT,
+        getInterop: UnusedSlot,
+        getPipeline: *const fn (*Self, *Pipeline, *?*anyopaque, *?*anyopaque) callconv(.c) HRESULT,
+        getPipelineName: UnusedSlot,
+        getOpenGLInteropHelper: UnusedSlot,
+        getSupportedResourceFormats: UnusedSlot,
+        getMaximumTextureSize: UnusedSlot,
+    };
 };
 
 pub const IBlackmagicRaw = extern struct {
@@ -442,7 +479,7 @@ pub const IBlackmagicRawConfiguration = extern struct {
         getMaxCPUThreadCount: *const fn (*Self, *u32) callconv(.c) HRESULT,
         setWriteMetadataPerFrame: UnusedSlot,
         getWriteMetadataPerFrame: UnusedSlot,
-        setFromDevice: UnusedSlot,
+        setFromDevice: *const fn (*Self, *IBlackmagicRawPipelineDevice) callconv(.c) HRESULT,
         getVersion: *const fn (*Self, *StringRaw) callconv(.c) HRESULT,
         getCameraSupportVersion: *const fn (*Self, *StringRaw) callconv(.c) HRESULT,
     };

@@ -8,6 +8,7 @@ pub const strings = @import("braw/strings.zig");
 pub const variant = @import("braw/variant.zig");
 pub const loader = @import("braw/loader.zig");
 pub const cuda = @import("braw/cuda.zig");
+pub const metal = @import("braw/metal.zig");
 pub const formats = @import("formats.zig");
 pub const meta = @import("meta.zig");
 pub const decoder = @import("decoder.zig");
@@ -29,4 +30,6 @@ test {
     _ = decoder;
     _ = sync;
     _ = audio;
+    _ = cuda;
+    _ = metal;
 }
