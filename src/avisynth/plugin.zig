@@ -32,7 +32,10 @@ extern fn bsrc_module_dir([*]u8, c_int) c_int;
 var g_lib: ?*c.AVS_Library = null;
 
 const Api = struct {
-    new_video_frame_p_a: *const fn (?*Env, ?*const VI, ?*VF, c_int) callconv(cc) ?*VF,
+    // classic, always-present allocator (env, vi, align). The prop-carrying
+    // _p_a variant is optional and dereferences a NULL prop_src, which a
+    // source filter has none of.
+    new_video_frame_a: *const fn (?*Env, ?*const VI, c_int) callconv(cc) ?*VF,
     release_video_frame: *const fn (?*VF) callconv(cc) void,
     get_write_ptr_p: *const fn (?*VF, c_int) callconv(cc) [*c]u8,
     get_pitch_p: *const fn (?*const VF, c_int) callconv(cc) c_int,
@@ -52,7 +55,7 @@ var api: Api = undefined;
 fn loadApi() void {
     const L = g_lib.?;
     api = .{
-        .new_video_frame_p_a = @ptrCast(L.avs_new_video_frame_p_a.?),
+        .new_video_frame_a = @ptrCast(L.avs_new_video_frame_a.?),
         .release_video_frame = @ptrCast(L.avs_release_video_frame.?),
         .get_write_ptr_p = @ptrCast(L.avs_get_write_ptr_p.?),
         .get_pitch_p = @ptrCast(L.avs_get_pitch_p.?),
@@ -88,10 +91,6 @@ fn argAt(args: *const Val, i: usize) Val {
     var v: Val = std.mem.zeroes(Val);
     v.type = 'v';
     return v;
-}
-
-fn defined(v: Val) bool {
-    return v.type != 'v';
 }
 
 fn asStr(v: Val) ?[]const u8 {
@@ -157,7 +156,7 @@ fn getFrame(fi_opt: [*c]FI, n: c_int) callconv(cc) ?*VF {
         return null;
     }
 
-    const frame = api.new_video_frame_p_a(fi.env, &fi.vi, null, c.AVS_FRAME_ALIGN) orelse {
+    const frame = api.new_video_frame_a(fi.env, &fi.vi, c.AVS_FRAME_ALIGN) orelse {
         fi.@"error" = "BRAWSource: failed to allocate frame";
         return null;
     };
