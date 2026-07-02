@@ -126,21 +126,24 @@ pub fn candidatePaths(
         list.deinit(gpa);
     }
 
-    if (explicit) |e| {
-        if (isDir(e)) {
-            try list.append(gpa, try std.fs.path.joinZ(gpa, &.{ e, lib_file_name }));
-        } else {
-            try list.append(gpa, try gpa.dupeZ(u8, e));
+    // an explicit path or env var may point at the library file itself or
+    // at the directory containing it
+    const appendFileOrDir = struct {
+        fn f(g: std.mem.Allocator, l: *std.ArrayList([:0]u8), base: []const u8) !void {
+            if (isDir(base)) {
+                try l.append(g, try std.fs.path.joinZ(g, &.{ base, lib_file_name }));
+            } else {
+                try l.append(g, try g.dupeZ(u8, base));
+            }
         }
+    }.f;
+
+    if (explicit) |e| {
+        try appendFileOrDir(gpa, &list, e);
         return try list.toOwnedSlice(gpa);
     }
-
     if (getEnv(env_var)) |env_val| {
-        if (isDir(env_val)) {
-            try list.append(gpa, try std.fs.path.joinZ(gpa, &.{ env_val, lib_file_name }));
-        } else {
-            try list.append(gpa, try gpa.dupeZ(u8, env_val));
-        }
+        try appendFileOrDir(gpa, &list, env_val);
         return try list.toOwnedSlice(gpa);
     }
 

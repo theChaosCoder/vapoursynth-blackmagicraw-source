@@ -106,17 +106,7 @@ fn sourceGetFrame(
         zapi.freeFrame(dst);
         if (alpha_frame) |af| zapi.freeFrame(af);
         var buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "braw.Source: {s} for frame {d} ({s}, hr=0x{x})", .{
-            switch (e) {
-                error.DroppedFrame => "dropped frame in source clip",
-                error.OutOfMemory => "out of memory",
-                else => "decode failed",
-            },
-            n,
-            fm.fail_stage,
-            @as(u32, @bitCast(fm.fail_hr)),
-        }) catch "braw.Source: decode failed";
-        zapi.setFilterError(msg);
+        zapi.setFilterError(core_mod.decoder.formatDecodeError(&buf, "braw.Source", e, n, &fm));
         return null;
     };
 
@@ -260,23 +250,9 @@ fn audioCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaque
     };
     const libpath = map_in.getData("libpath", 0);
 
-    var plugin_dir_buf: [4096]u8 = undefined;
-    const plugin_dir = pluginDir(vsapi, core, &plugin_dir_buf);
-
-    var err_detail: ?[]u8 = null;
-    const dec = core_mod.Decoder.open(allocator, source, .{
+    const dec = openFromMap(vsapi, core, map_out, "braw.AudioSource", source, .{
         .libpath = libpath,
-        .plugin_dir = plugin_dir,
-    }, &err_detail) catch |e| {
-        defer if (err_detail) |ed| allocator.free(ed);
-        map_out.setError2("braw.AudioSource: failed to open '{s}': {s}{s}{s}", .{
-            source,
-            @errorName(e),
-            if (err_detail != null) "\n" else "",
-            if (err_detail) |ed| ed else "",
-        });
-        return;
-    };
+    }) orelse return;
 
     const au = dec.info.audio orelse {
         dec.close();
@@ -343,6 +319,51 @@ fn pluginDir(vsapi: ?*const vs.API, core: ?*vs.Core, buf: []u8) ?[]const u8 {
     return buf[0..dir.len];
 }
 
+/// Shared open path of Source/AudioSource: plugin-dir discovery, decoder
+/// open, error reporting with searched-path details.
+fn openFromMap(
+    vsapi: ?*const vs.API,
+    core: ?*vs.Core,
+    map_out: anytype,
+    comptime fname: []const u8,
+    source: []const u8,
+    opts_in: core_mod.OpenOptions,
+) ?*core_mod.Decoder {
+    var opts = opts_in;
+    var plugin_dir_buf: [4096]u8 = undefined;
+    opts.plugin_dir = pluginDir(vsapi, core, &plugin_dir_buf);
+
+    var err_detail: ?[]u8 = null;
+    return core_mod.Decoder.open(allocator, source, opts, &err_detail) catch |e| {
+        defer if (err_detail) |ed| allocator.free(ed);
+        map_out.setError2(fname ++ ": failed to open '{s}': {s}{s}{s}", .{
+            source,
+            @errorName(e),
+            if (err_detail != null) "\n" else "",
+            if (err_detail) |ed| ed else "",
+        });
+        return null;
+    };
+}
+
+fn depthErrorMsg(comptime fname: []const u8, e: core_mod.formats.DepthSelectError) [:0]const u8 {
+    return switch (e) {
+        error.BadFormatString => fname ++ ": 'format' must be one of auto, u8, u16, f16, f32",
+        error.NoFloat8 => fname ++ ": there is no 8-bit float format",
+        error.BadBitdepth => fname ++ ": 'bitdepth' must be 8, 16 or 32",
+        error.FpRequiresBitdepth => fname ++ ": 'fp' requires 'bitdepth'",
+    };
+}
+
+fn overrideErrorMsg(comptime fname: []const u8, e: core_mod.decoder.OverrideError) [:0]const u8 {
+    return switch (e) {
+        error.KelvinOutOfRange => fname ++ ": 'kelvin' out of range",
+        error.TintOutOfRange => fname ++ ": 'tint' out of range",
+        error.IsoOutOfRange => fname ++ ": 'iso' out of range",
+        error.ColorScienceOutOfRange => fname ++ ": 'colorscience' out of range",
+    };
+}
+
 fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaque, core: ?*vs.Core, vsapi: ?*const vs.API) callconv(.c) void {
     _ = user_data;
     const zapi = ZAPI.init(vsapi, core, null);
@@ -355,37 +376,14 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
         return;
     };
 
-    // depth selection: bitdepth=8|16|32 (+fp for float) is the primary API;
-    // format="u8|u16|f16|f32|auto" remains as an alias. Unset = automatic
-    // (16-bit int, or 32-bit float for Linear gamma).
-    var depth: ?core_mod.formats.Depth = null;
-    if (map_in.getData("format", 0)) |fmt_str| {
-        if (!std.ascii.eqlIgnoreCase(fmt_str, "auto")) {
-            depth = core_mod.formats.Depth.parse(fmt_str) orelse {
-                map_out.setError("braw.Source: 'format' must be one of auto, u8, u16, f16, f32");
-                return;
-            };
-        }
-    }
-    const fp = map_in.getBool("fp");
-    if (map_in.getInt(i64, "bitdepth")) |b| {
-        const want_fp = fp orelse false;
-        depth = switch (b) {
-            8 => if (want_fp) {
-                map_out.setError("braw.Source: there is no 8-bit float format");
-                return;
-            } else .u8_,
-            16 => if (want_fp) .f16 else .u16_,
-            32 => .f32_,
-            else => {
-                map_out.setError("braw.Source: 'bitdepth' must be 8, 16 or 32");
-                return;
-            },
-        };
-    } else if (fp != null) {
-        map_out.setError("braw.Source: 'fp' requires 'bitdepth'");
+    const depth = core_mod.formats.resolveDepth(
+        map_in.getData("format", 0),
+        map_in.getInt(i64, "bitdepth"),
+        map_in.getBool("fp"),
+    ) catch |e| {
+        map_out.setError(depthErrorMsg("braw.Source", e));
         return;
-    }
+    };
     const alpha = map_in.getBool("alpha") orelse false;
     var scale: core_mod.decoder.Scale = .full;
     if (map_in.getInt(i64, "scale")) |s| {
@@ -395,42 +393,32 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
         };
     }
 
-    var frame_overrides: core_mod.decoder.FrameOverrides = .{};
-    if (map_in.getInt(i64, "kelvin")) |v| frame_overrides.kelvin = std.math.cast(u32, v) orelse {
-        map_out.setError("braw.Source: 'kelvin' out of range");
+    const frame_overrides = core_mod.decoder.frameOverridesFromParams(
+        map_in.getInt(i64, "kelvin"),
+        map_in.getInt(i64, "tint"),
+        map_in.getFloat(f64, "exposure"),
+        map_in.getInt(i64, "iso"),
+    ) catch |e| {
+        map_out.setError(overrideErrorMsg("braw.Source", e));
         return;
     };
-    if (map_in.getInt(i64, "tint")) |v| frame_overrides.tint = std.math.cast(i16, v) orelse {
-        map_out.setError("braw.Source: 'tint' out of range");
+    const clip_overrides = core_mod.decoder.clipOverridesFromParams(
+        map_in.getData("gamma", 0),
+        map_in.getData("gamut", 0),
+        map_in.getInt(i64, "colorscience"),
+        map_in.getBool("highlightrecovery"),
+        map_in.getBool("gamutcompression"),
+    ) catch |e| {
+        map_out.setError(overrideErrorMsg("braw.Source", e));
         return;
     };
-    if (map_in.getFloat(f64, "exposure")) |v| frame_overrides.exposure = @floatCast(v);
-    if (map_in.getInt(i64, "iso")) |v| frame_overrides.iso = std.math.cast(u32, v) orelse {
-        map_out.setError("braw.Source: 'iso' out of range");
-        return;
-    };
-
-    var clip_overrides: core_mod.decoder.ClipOverrides = .{};
-    if (map_in.getData("gamma", 0)) |v| clip_overrides.gamma = v;
-    if (map_in.getData("gamut", 0)) |v| clip_overrides.gamut = v;
-    if (map_in.getInt(i64, "colorscience")) |v| clip_overrides.colorscience = std.math.cast(u16, v) orelse {
-        map_out.setError("braw.Source: 'colorscience' out of range");
-        return;
-    };
-    if (map_in.getBool("highlightrecovery")) |v| clip_overrides.highlight_recovery = v;
-    if (map_in.getBool("gamutcompression")) |v| clip_overrides.gamut_compression = v;
 
     const threads: u32 = if (map_in.getInt(i64, "threads")) |t| std.math.cast(u32, t) orelse 0 else 0;
     const collect_all = map_in.getBool("allmetaprops") orelse false;
     const libpath = map_in.getData("libpath", 0);
 
-    var plugin_dir_buf: [4096]u8 = undefined;
-    const plugin_dir = pluginDir(vsapi, core, &plugin_dir_buf);
-
-    var err_detail: ?[]u8 = null;
-    const dec = core_mod.Decoder.open(allocator, source, .{
+    const dec = openFromMap(vsapi, core, map_out, "braw.Source", source, .{
         .libpath = libpath,
-        .plugin_dir = plugin_dir,
         .threads = threads,
         .depth = depth,
         .alpha = alpha,
@@ -438,16 +426,7 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
         .collect_all_meta = collect_all,
         .frame_overrides = frame_overrides,
         .clip_overrides = clip_overrides,
-    }, &err_detail) catch |e| {
-        defer if (err_detail) |ed| allocator.free(ed);
-        map_out.setError2("braw.Source: failed to open '{s}': {s}{s}{s}", .{
-            source,
-            @errorName(e),
-            if (err_detail != null) "\n" else "",
-            if (err_detail) |ed| ed else "",
-        });
-        return;
-    };
+    }) orelse return;
 
     const info = dec.info;
     if (info.frame_count == 0 or info.frame_count > std.math.maxInt(c_int)) {

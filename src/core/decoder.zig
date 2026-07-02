@@ -74,6 +74,41 @@ pub const ClipOverrides = struct {
     }
 };
 
+pub const OverrideError = error{
+    KelvinOutOfRange,
+    TintOutOfRange,
+    IsoOutOfRange,
+    ColorScienceOutOfRange,
+};
+
+/// Build FrameOverrides from raw host parameters with range validation —
+/// shared by both adapters so limits live in exactly one place.
+pub fn frameOverridesFromParams(kelvin: ?i64, tint: ?i64, exposure: ?f64, iso: ?i64) OverrideError!FrameOverrides {
+    var o: FrameOverrides = .{};
+    if (kelvin) |v| o.kelvin = std.math.cast(u32, v) orelse return error.KelvinOutOfRange;
+    if (tint) |v| o.tint = std.math.cast(i16, v) orelse return error.TintOutOfRange;
+    if (exposure) |v| o.exposure = @floatCast(v);
+    if (iso) |v| o.iso = std.math.cast(u32, v) orelse return error.IsoOutOfRange;
+    return o;
+}
+
+pub fn clipOverridesFromParams(
+    gamma: ?[]const u8,
+    gamut: ?[]const u8,
+    colorscience: ?i64,
+    highlight_recovery: ?bool,
+    gamut_compression: ?bool,
+) OverrideError!ClipOverrides {
+    var o: ClipOverrides = .{
+        .gamma = gamma,
+        .gamut = gamut,
+        .highlight_recovery = highlight_recovery,
+        .gamut_compression = gamut_compression,
+    };
+    if (colorscience) |v| o.colorscience = std.math.cast(u16, v) orelse return error.ColorScienceOutOfRange;
+    return o;
+}
+
 pub const OpenOptions = struct {
     libpath: ?[]const u8 = null,
     plugin_dir: ?[]const u8 = null,
@@ -130,6 +165,27 @@ pub const DecodeError = error{
     DecodeFailed,
     OutOfMemory,
 };
+
+/// Render the standard decode-failure message (shared by both adapters,
+/// which only differ in the function-name prefix).
+pub fn formatDecodeError(
+    buf: []u8,
+    comptime prefix: []const u8,
+    e: DecodeError,
+    n: i64,
+    fm: *const FrameMeta,
+) [:0]const u8 {
+    return std.fmt.bufPrintZ(buf, prefix ++ ": {s} for frame {d} ({s}, hr=0x{x})", .{
+        switch (e) {
+            error.DroppedFrame => "dropped frame in source clip",
+            error.OutOfMemory => "out of memory",
+            error.DecodeFailed => "decode failed",
+        },
+        n,
+        fm.fail_stage,
+        @as(u32, @bitCast(fm.fail_hr)),
+    }) catch prefix ++ ": decode failed";
+}
 
 /// Result metadata of a single decoded frame. Owned by the caller.
 pub const FrameMeta = struct {
@@ -202,78 +258,56 @@ fn reqFromJob(job: *api.IBlackmagicRawJob) ?*Request {
     return job.userData(Request);
 }
 
+fn failAndSignal(req: *Request, hr: api.HRESULT, stage: []const u8) void {
+    req.fail(hr, stage);
+    req.event.set();
+}
+
 fn cbReadComplete(_: *anyopaque, job: *api.IBlackmagicRawJob, hr: api.HRESULT, frame_opt: ?*api.IBlackmagicRawFrame) callconv(.c) void {
     defer api.release(job);
     const req = reqFromJob(job) orelse return;
 
-    if (hr != api.S_OK) {
-        req.fail(hr, "read frame");
-        req.event.set();
-        return;
-    }
-    const frame = frame_opt orelse {
-        req.fail(api.E_FAIL, "read frame (no frame object)");
-        req.event.set();
-        return;
-    };
+    if (hr != api.S_OK) return failAndSignal(req, hr, "read frame");
+    const frame = frame_opt orelse
+        return failAndSignal(req, api.E_FAIL, "read frame (no frame object)");
 
     harvestFrameMeta(req, frame);
 
     // frame-accuracy invariant: the SDK must hand us exactly the frame we asked for
     var got_index: u64 = 0;
     if (frame.v.getFrameIndex(frame, &got_index) == api.S_OK and got_index != req.expected_index) {
-        req.fail(api.E_FAIL, "frame index mismatch");
-        req.event.set();
-        return;
+        return failAndSignal(req, api.E_FAIL, "frame index mismatch");
     }
 
-    const dest = req.dest orelse {
+    if (req.dest == null) {
         // metadata probe only
         req.event.set();
         return;
-    };
-    _ = dest;
+    }
 
     if (req.scale != .full) {
         const shr = frame.v.setResolutionScale(frame, req.scale);
-        if (shr != api.S_OK) {
-            req.fail(shr, "set resolution scale");
-            req.event.set();
-            return;
-        }
+        if (shr != api.S_OK) return failAndSignal(req, shr, "set resolution scale");
     }
     const fhr = frame.v.setResourceFormat(frame, req.resource_format);
-    if (fhr != api.S_OK) {
-        req.fail(fhr, "set resource format");
-        req.event.set();
-        return;
-    }
+    if (fhr != api.S_OK) return failAndSignal(req, fhr, "set resource format");
 
     if (req.decoder.frame_overrides.any()) {
-        if (buildFrameAttrs(req.decoder, frame)) |fa| {
-            req.frame_attrs = fa;
-        } else |_| {
-            req.fail(api.E_FAIL, "apply frame processing overrides");
-            req.event.set();
-            return;
-        }
+        req.frame_attrs = buildFrameAttrs(req.decoder, frame) catch
+            return failAndSignal(req, api.E_FAIL, "apply frame processing overrides");
     }
 
     var decode_job: ?*api.IBlackmagicRawJob = null;
     const dhr = frame.v.createJobDecodeAndProcessFrame(frame, req.decoder.clip_attrs, req.frame_attrs, &decode_job);
     if (dhr != api.S_OK or decode_job == null) {
-        req.fail(dhr, "create decode job");
-        req.event.set();
-        return;
+        return failAndSignal(req, dhr, "create decode job");
     }
     const dj = decode_job.?;
     _ = dj.v.setUserData(dj, req);
     const shr2 = dj.v.submit(dj);
     if (shr2 != api.S_OK) {
         api.release(dj);
-        req.fail(shr2, "submit decode job");
-        req.event.set();
-        return;
+        return failAndSignal(req, shr2, "submit decode job");
     }
 }
 
@@ -364,9 +398,114 @@ const callback_vtable: api.CallbackVTable = if (api.is_windows) .{
 // Metadata harvesting (called on SDK threads; touches only Request memory)
 // ---------------------------------------------------------------------------
 
+/// Walk a metadata iterator: getKey -> Variant -> MetaValue, then hand each
+/// entry to `handler`. The handler returns true when it took ownership of
+/// the value; otherwise it is freed here. Allocation failures propagate.
+fn iterateMetadata(
+    lib: *loader.Lib,
+    gpa: std.mem.Allocator,
+    it: *api.IBlackmagicRawMetadataIterator,
+    ctx: anytype,
+    comptime handler: fn (@TypeOf(ctx), []const u8, *variant.MetaValue) std.mem.Allocator.Error!bool,
+) std.mem.Allocator.Error!void {
+    var key_raw: api.StringRaw = null;
+    while (it.v.getKey(it, &key_raw) == api.S_OK) {
+        defer {
+            key_raw = null;
+            _ = it.v.next(it);
+        }
+        // dupe's error set is platform-dependent (UTF-16 decode errors on
+        // Windows); only OOM aborts, malformed keys are skipped
+        const key = strings.dupe(gpa, key_raw, false) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            continue;
+        };
+        defer gpa.free(key);
+
+        var v: api.Variant = .empty;
+        variant.variantInit(lib, &v);
+        if (it.v.getData(it, &v) != api.S_OK) continue;
+        defer variant.variantClear(lib, &v);
+
+        // toMeta's error set is platform-dependent (StringConversionFailed
+        // exists only on macOS), so no exhaustive switch here
+        var mv = variant.toMeta(gpa, lib, &v) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            continue;
+        };
+        errdefer mv.deinit(gpa);
+        if (!try handler(ctx, key, &mv)) mv.deinit(gpa);
+    }
+}
+
+/// Append `mv` to the curated list when the key is known, or (optionally)
+/// to the raw list as BRAW_<key>. Returns whether the value was consumed.
+fn dispatchMeta(
+    gpa: std.mem.Allocator,
+    key: []const u8,
+    mv: *variant.MetaValue,
+    prop_name: ?[]const u8,
+    collect_all: bool,
+    curated: *meta.PropList,
+    all: *meta.PropList,
+) std.mem.Allocator.Error!bool {
+    if (prop_name) |name| {
+        try curated.append(gpa, name, mv.*);
+        return true;
+    }
+    if (collect_all) {
+        var namebuf: [128]u8 = undefined;
+        const pname = std.fmt.bufPrint(&namebuf, "BRAW_{s}", .{key}) catch key;
+        try all.append(gpa, pname, mv.*);
+        return true;
+    }
+    return false;
+}
+
+fn frameMetaHandler(req: *Request, key: []const u8, mv: *variant.MetaValue) std.mem.Allocator.Error!bool {
+    if (std.mem.eql(u8, key, "sensor_rate")) {
+        switch (mv.*) {
+            .float_array => |a| if (a.len >= 2) {
+                req.sensor_rate = .{ a[0], a[1] };
+            },
+            .int_array => |a| if (a.len >= 2) {
+                req.sensor_rate = .{ @floatFromInt(a[0]), @floatFromInt(a[1]) };
+            },
+            else => {},
+        }
+    }
+    return dispatchMeta(req.gpa, key, mv, meta.framePropName(key), req.collect_all_meta, &req.props, &req.props_all);
+}
+
+/// Sink for the clip-level metadata pass: curated/all props on the decoder
+/// plus capture of the viewing gamma/gamut names for depth/CICP resolution.
+const ClipMetaCtx = struct {
+    dec: *Decoder,
+    gamma_buf: [64]u8 = undefined,
+    gamma_len: usize = 0,
+    gamut_buf: [64]u8 = undefined,
+    gamut_len: usize = 0,
+};
+
+fn clipMetaHandler(ctx: *ClipMetaCtx, key: []const u8, mv: *variant.MetaValue) std.mem.Allocator.Error!bool {
+    switch (mv.*) {
+        .string => |s| {
+            if (std.mem.eql(u8, key, "viewing_gamma") and s.len <= ctx.gamma_buf.len) {
+                @memcpy(ctx.gamma_buf[0..s.len], s);
+                ctx.gamma_len = s.len;
+            } else if (std.mem.eql(u8, key, "viewing_gamut") and s.len <= ctx.gamut_buf.len) {
+                @memcpy(ctx.gamut_buf[0..s.len], s);
+                ctx.gamut_len = s.len;
+            }
+        },
+        else => {},
+    }
+    const dec = ctx.dec;
+    return dispatchMeta(dec.gpa, key, mv, meta.clipPropName(key), dec.collect_all_meta, &dec.clip_props, &dec.clip_props_all);
+}
+
 fn harvestFrameMeta(req: *Request, frame: *api.IBlackmagicRawFrame) void {
     const gpa = req.gpa;
-    const d = req.decoder;
 
     var tc_raw: api.StringRaw = null;
     if (frame.v.getTimecode(frame, &tc_raw) == api.S_OK) {
@@ -378,59 +517,18 @@ fn harvestFrameMeta(req: *Request, frame: *api.IBlackmagicRawFrame) void {
     const it = it_opt orelse return;
     defer api.release(it);
 
-    var key_raw: api.StringRaw = null;
-    while (it.v.getKey(it, &key_raw) == api.S_OK) {
-        defer {
-            key_raw = null;
-            if (it.v.next(it) != api.S_OK) {}
-        }
-        const key = strings.dupe(gpa, key_raw, false) catch {
-            req.oom = true;
-            return;
-        };
-        defer gpa.free(key);
+    iterateMetadata(req.decoder.lib, gpa, it, req, frameMetaHandler) catch {
+        req.oom = true;
+    };
+}
 
-        var v: api.Variant = .empty;
-        variant.variantInit(d.lib, &v);
-        if (it.v.getData(it, &v) != api.S_OK) continue;
-        defer variant.variantClear(d.lib, &v);
-
-        var mv = variant.toMeta(gpa, d.lib, &v) catch {
-            req.oom = true;
-            return;
-        };
-
-        var consumed = false;
-        if (std.mem.eql(u8, key, "sensor_rate")) {
-            switch (mv) {
-                .float_array => |a| if (a.len >= 2) {
-                    req.sensor_rate = .{ a[0], a[1] };
-                },
-                .int_array => |a| if (a.len >= 2) {
-                    req.sensor_rate = .{ @floatFromInt(a[0]), @floatFromInt(a[1]) };
-                },
-                else => {},
-            }
-        }
-        if (meta.framePropName(key)) |prop_name| {
-            req.props.append(gpa, prop_name, mv) catch {
-                mv.deinit(gpa);
-                req.oom = true;
-                return;
-            };
-            consumed = true;
-        } else if (req.collect_all_meta) {
-            var namebuf: [128]u8 = undefined;
-            const pname = std.fmt.bufPrint(&namebuf, "BRAW_{s}", .{key}) catch key;
-            req.props_all.append(gpa, pname, mv) catch {
-                mv.deinit(gpa);
-                req.oom = true;
-                return;
-            };
-            consumed = true;
-        }
-        if (!consumed) mv.deinit(gpa);
-    }
+fn setFrameAttr(
+    fa: *api.IBlackmagicRawFrameProcessingAttributes,
+    attr: api.FrameProcessingAttribute,
+    value: api.Variant,
+) error{AttrFailed}!void {
+    var v = value;
+    if (fa.v.setFrameAttribute(fa, attr, &v) != api.S_OK) return error.AttrFailed;
 }
 
 fn buildFrameAttrs(d: *Decoder, frame: *api.IBlackmagicRawFrame) !*api.IBlackmagicRawFrameProcessingAttributes {
@@ -440,30 +538,10 @@ fn buildFrameAttrs(d: *Decoder, frame: *api.IBlackmagicRawFrame) !*api.IBlackmag
     errdefer api.release(fa);
 
     const o = d.frame_overrides;
-    if (o.kelvin) |k| {
-        var v: api.Variant = .empty;
-        v.vt = if (api.is_windows) api.vt_win.u32_ else api.vt_unix.u32_;
-        v.u = .{ .uintVal = k };
-        if (fa.v.setFrameAttribute(fa, .white_balance_kelvin, &v) != api.S_OK) return error.AttrFailed;
-    }
-    if (o.tint) |t| {
-        var v: api.Variant = .empty;
-        v.vt = if (api.is_windows) api.vt_win.s16 else api.vt_unix.s16;
-        v.u = .{ .iVal = t };
-        if (fa.v.setFrameAttribute(fa, .white_balance_tint, &v) != api.S_OK) return error.AttrFailed;
-    }
-    if (o.exposure) |e| {
-        var v: api.Variant = .empty;
-        v.vt = if (api.is_windows) api.vt_win.f32_ else api.vt_unix.f32_;
-        v.u = .{ .fltVal = e };
-        if (fa.v.setFrameAttribute(fa, .exposure, &v) != api.S_OK) return error.AttrFailed;
-    }
-    if (o.iso) |i| {
-        var v: api.Variant = .empty;
-        v.vt = if (api.is_windows) api.vt_win.u32_ else api.vt_unix.u32_;
-        v.u = .{ .uintVal = i };
-        if (fa.v.setFrameAttribute(fa, .iso, &v) != api.S_OK) return error.AttrFailed;
-    }
+    if (o.kelvin) |k| try setFrameAttr(fa, .white_balance_kelvin, api.variantU32(k));
+    if (o.tint) |t| try setFrameAttr(fa, .white_balance_tint, api.variantI16(t));
+    if (o.exposure) |e| try setFrameAttr(fa, .exposure, api.variantF32(e));
+    if (o.iso) |i| try setFrameAttr(fa, .iso, api.variantU32(i));
     return fa;
 }
 
@@ -598,6 +676,33 @@ pub const Decoder = struct {
         return error.InvalidProcessingAttribute;
     }
 
+    fn setClipAttr(
+        self: *Decoder,
+        err_detail: *?[]u8,
+        ca: *api.IBlackmagicRawClipProcessingAttributes,
+        attr: api.ClipProcessingAttribute,
+        value: api.Variant,
+        name: []const u8,
+    ) OpenError!void {
+        var v = value;
+        if (ca.v.setClipAttribute(ca, attr, &v) != api.S_OK) {
+            return self.attrRejected(err_detail, name);
+        }
+    }
+
+    fn setClipAttrString(
+        self: *Decoder,
+        err_detail: *?[]u8,
+        ca: *api.IBlackmagicRawClipProcessingAttributes,
+        attr: api.ClipProcessingAttribute,
+        value: []const u8,
+        name: []const u8,
+    ) OpenError!void {
+        var owned = strings.make(self.gpa, value) catch return error.OutOfMemory;
+        defer owned.deinit(self.gpa);
+        try self.setClipAttr(err_detail, ca, attr, api.variantString(owned.raw), name);
+    }
+
     fn applyClipOverrides(self: *Decoder, o: ClipOverrides, err_detail: *?[]u8) OpenError!void {
         var ca_opt: ?*api.IBlackmagicRawClipProcessingAttributes = null;
         if (self.clip.v.cloneClipProcessingAttributes(self.clip, &ca_opt) != api.S_OK) {
@@ -607,48 +712,19 @@ pub const Decoder = struct {
         self.clip_attrs = ca;
 
         if (o.colorscience) |g| {
-            var v: api.Variant = .empty;
-            v.vt = if (api.is_windows) api.vt_win.u16_ else api.vt_unix.u16_;
-            v.u = .{ .uiVal = g };
-            if (ca.v.setClipAttribute(ca, .color_science_gen, &v) != api.S_OK) {
-                return self.attrRejected(err_detail, "colorscience");
-            }
+            try self.setClipAttr(err_detail, ca, .color_science_gen, api.variantU16(g), "colorscience");
         }
         if (o.gamma) |s| {
-            var owned = strings.make(self.gpa, s) catch return error.OutOfMemory;
-            defer owned.deinit(self.gpa);
-            var v: api.Variant = .empty;
-            v.vt = if (api.is_windows) api.vt_win.string else api.vt_unix.string;
-            v.u = .{ .bstrVal = owned.raw };
-            if (ca.v.setClipAttribute(ca, .gamma, &v) != api.S_OK) {
-                return self.attrRejected(err_detail, "gamma");
-            }
+            try self.setClipAttrString(err_detail, ca, .gamma, s, "gamma");
         }
         if (o.gamut) |s| {
-            var owned = strings.make(self.gpa, s) catch return error.OutOfMemory;
-            defer owned.deinit(self.gpa);
-            var v: api.Variant = .empty;
-            v.vt = if (api.is_windows) api.vt_win.string else api.vt_unix.string;
-            v.u = .{ .bstrVal = owned.raw };
-            if (ca.v.setClipAttribute(ca, .gamut, &v) != api.S_OK) {
-                return self.attrRejected(err_detail, "gamut");
-            }
+            try self.setClipAttrString(err_detail, ca, .gamut, s, "gamut");
         }
         if (o.highlight_recovery) |b| {
-            var v: api.Variant = .empty;
-            v.vt = if (api.is_windows) api.vt_win.u16_ else api.vt_unix.u16_;
-            v.u = .{ .uiVal = @intFromBool(b) };
-            if (ca.v.setClipAttribute(ca, .highlight_recovery, &v) != api.S_OK) {
-                return self.attrRejected(err_detail, "highlightrecovery");
-            }
+            try self.setClipAttr(err_detail, ca, .highlight_recovery, api.variantU16(@intFromBool(b)), "highlightrecovery");
         }
         if (o.gamut_compression) |b| {
-            var v: api.Variant = .empty;
-            v.vt = if (api.is_windows) api.vt_win.u16_ else api.vt_unix.u16_;
-            v.u = .{ .uiVal = @intFromBool(b) };
-            if (ca.v.setClipAttribute(ca, .gamut_compression_enable, &v) != api.S_OK) {
-                return self.attrRejected(err_detail, "gamutcompression");
-            }
+            try self.setClipAttr(err_detail, ca, .gamut_compression_enable, api.variantU16(@intFromBool(b)), "gamutcompression");
         }
     }
 
@@ -680,54 +756,18 @@ pub const Decoder = struct {
         }
 
         // clip-level metadata
-        var gamma_buf: [64]u8 = undefined;
-        var gamma_len: usize = 0;
-        var gamut_buf: [64]u8 = undefined;
-        var gamut_len: usize = 0;
+        var clip_ctx: ClipMetaCtx = .{ .dec = self };
         var it_opt: ?*api.IBlackmagicRawMetadataIterator = null;
         if (clip.v.getMetadataIterator(clip, &it_opt) == api.S_OK) {
             if (it_opt) |it| {
                 defer api.release(it);
-                var key_raw: api.StringRaw = null;
-                while (it.v.getKey(it, &key_raw) == api.S_OK) {
-                    defer {
-                        key_raw = null;
-                        _ = it.v.next(it);
-                    }
-                    const key = strings.dupe(gpa, key_raw, false) catch return error.OutOfMemory;
-                    defer gpa.free(key);
-
-                    var v: api.Variant = .empty;
-                    variant.variantInit(self.lib, &v);
-                    if (it.v.getData(it, &v) != api.S_OK) continue;
-                    defer variant.variantClear(self.lib, &v);
-                    var mv = variant.toMeta(gpa, self.lib, &v) catch return error.OutOfMemory;
-
-                    switch (mv) {
-                        .string => |s| {
-                            if (std.mem.eql(u8, key, "viewing_gamma") and s.len <= gamma_buf.len) {
-                                @memcpy(gamma_buf[0..s.len], s);
-                                gamma_len = s.len;
-                            } else if (std.mem.eql(u8, key, "viewing_gamut") and s.len <= gamut_buf.len) {
-                                @memcpy(gamut_buf[0..s.len], s);
-                                gamut_len = s.len;
-                            }
-                        },
-                        else => {},
-                    }
-
-                    if (meta.clipPropName(key)) |prop_name| {
-                        self.clip_props.append(gpa, prop_name, mv) catch return error.OutOfMemory;
-                    } else if (self.collect_all_meta) {
-                        var namebuf: [128]u8 = undefined;
-                        const pname = std.fmt.bufPrint(&namebuf, "BRAW_{s}", .{key}) catch key;
-                        self.clip_props_all.append(gpa, pname, mv) catch return error.OutOfMemory;
-                    } else {
-                        mv.deinit(gpa);
-                    }
-                }
+                try iterateMetadata(self.lib, gpa, it, &clip_ctx, clipMetaHandler);
             }
         }
+        const gamma_buf = clip_ctx.gamma_buf;
+        const gamma_len = clip_ctx.gamma_len;
+        const gamut_buf = clip_ctx.gamut_buf;
+        const gamut_len = clip_ctx.gamut_len;
 
         // metadata-probe frame 0 for the sensor_rate rational
         var probe_meta: FrameMeta = .{};

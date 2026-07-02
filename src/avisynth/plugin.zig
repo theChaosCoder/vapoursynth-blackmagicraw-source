@@ -180,16 +180,7 @@ fn getFrame(fi_opt: [*c]FI, n: c_int) callconv(cc) ?*VF {
     d.dec.decodeFrame(@intCast(n), &dest, &fm) catch |e| {
         api.release_video_frame(frame);
         var buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "BRAWSource: {s} for frame {d} ({s}, hr=0x{x})", .{
-            switch (e) {
-                error.DroppedFrame => "dropped frame in source clip",
-                error.OutOfMemory => "out of memory",
-                else => "decode failed",
-            },
-            n,
-            fm.fail_stage,
-            @as(u32, @bitCast(fm.fail_hr)),
-        }) catch "BRAWSource: decode failed";
+        const msg = core_mod.decoder.formatDecodeError(&buf, "BRAWSource", e, n, &fm);
         fi.@"error" = api.save_string(fi.env, msg.ptr, @intCast(msg.len));
         return null;
     };
@@ -298,37 +289,19 @@ export fn bsrc_create_impl(env: ?*Env, args: *const Val, out: *Val, user_data: ?
         return;
     };
 
-    // depth selection: bitdepth=8|16|32 (+fp for float) is the primary API;
-    // format="u8|u16|f32|auto" remains as an alias. Unset = automatic
-    // (16-bit int, or 32-bit float for Linear gamma).
-    var depth: ?core_mod.formats.Depth = null;
-    if (asStr(argAt(args, arg_format))) |fmt_str| {
-        if (!std.ascii.eqlIgnoreCase(fmt_str, "auto")) {
-            depth = core_mod.formats.Depth.parse(fmt_str) orelse {
-                setErrorVal(env, out, "BRAWSource: format must be one of auto, u8, u16, f32");
-                return;
-            };
-        }
-    }
-    const fp = asBool(argAt(args, arg_fp));
-    if (asInt(argAt(args, arg_bitdepth))) |b| {
-        const want_fp = fp orelse false;
-        depth = switch (b) {
-            8 => if (want_fp) {
-                setErrorVal(env, out, "BRAWSource: there is no 8-bit float format");
-                return;
-            } else .u8_,
-            16 => if (want_fp) .f16 else .u16_,
-            32 => .f32_,
-            else => {
-                setErrorVal(env, out, "BRAWSource: bitdepth must be 8, 16 or 32");
-                return;
-            },
-        };
-    } else if (fp != null) {
-        setErrorVal(env, out, "BRAWSource: fp requires bitdepth");
+    const depth = core_mod.formats.resolveDepth(
+        asStr(argAt(args, arg_format)),
+        asInt(argAt(args, arg_bitdepth)),
+        asBool(argAt(args, arg_fp)),
+    ) catch |e| {
+        setErrorVal(env, out, switch (e) {
+            error.BadFormatString => "BRAWSource: format must be one of auto, u8, u16, f32",
+            error.NoFloat8 => "BRAWSource: there is no 8-bit float format",
+            error.BadBitdepth => "BRAWSource: bitdepth must be 8, 16 or 32",
+            error.FpRequiresBitdepth => "BRAWSource: fp requires bitdepth",
+        });
         return;
-    }
+    };
     if (depth) |dep| {
         if (dep == .f16) {
             setErrorVal(env, out, "BRAWSource: 16-bit float is not supported by AviSynth (use bitdepth=16 or 32)");
@@ -346,30 +319,35 @@ export fn bsrc_create_impl(env: ?*Env, args: *const Val, out: *Val, user_data: ?
         };
     }
 
-    var frame_overrides: core_mod.decoder.FrameOverrides = .{};
-    if (asInt(argAt(args, arg_kelvin))) |v| frame_overrides.kelvin = std.math.cast(u32, v) orelse {
-        setErrorVal(env, out, "BRAWSource: kelvin out of range");
+    const override_err_msg = struct {
+        fn f(e: core_mod.decoder.OverrideError) []const u8 {
+            return switch (e) {
+                error.KelvinOutOfRange => "BRAWSource: kelvin out of range",
+                error.TintOutOfRange => "BRAWSource: tint out of range",
+                error.IsoOutOfRange => "BRAWSource: iso out of range",
+                error.ColorScienceOutOfRange => "BRAWSource: colorscience out of range",
+            };
+        }
+    }.f;
+    const frame_overrides = core_mod.decoder.frameOverridesFromParams(
+        asInt(argAt(args, arg_kelvin)),
+        asInt(argAt(args, arg_tint)),
+        asFloat(argAt(args, arg_exposure)),
+        asInt(argAt(args, arg_iso)),
+    ) catch |e| {
+        setErrorVal(env, out, override_err_msg(e));
         return;
     };
-    if (asInt(argAt(args, arg_tint))) |v| frame_overrides.tint = std.math.cast(i16, v) orelse {
-        setErrorVal(env, out, "BRAWSource: tint out of range");
+    const clip_overrides = core_mod.decoder.clipOverridesFromParams(
+        asStr(argAt(args, arg_gamma)),
+        asStr(argAt(args, arg_gamut)),
+        asInt(argAt(args, arg_colorscience)),
+        asBool(argAt(args, arg_highlightrecovery)),
+        asBool(argAt(args, arg_gamutcompression)),
+    ) catch |e| {
+        setErrorVal(env, out, override_err_msg(e));
         return;
     };
-    if (asFloat(argAt(args, arg_exposure))) |v| frame_overrides.exposure = @floatCast(v);
-    if (asInt(argAt(args, arg_iso))) |v| frame_overrides.iso = std.math.cast(u32, v) orelse {
-        setErrorVal(env, out, "BRAWSource: iso out of range");
-        return;
-    };
-
-    var clip_overrides: core_mod.decoder.ClipOverrides = .{};
-    if (asStr(argAt(args, arg_gamma))) |v| clip_overrides.gamma = v;
-    if (asStr(argAt(args, arg_gamut))) |v| clip_overrides.gamut = v;
-    if (asInt(argAt(args, arg_colorscience))) |v| clip_overrides.colorscience = std.math.cast(u16, v) orelse {
-        setErrorVal(env, out, "BRAWSource: colorscience out of range");
-        return;
-    };
-    if (asBool(argAt(args, arg_highlightrecovery))) |v| clip_overrides.highlight_recovery = v;
-    if (asBool(argAt(args, arg_gamutcompression))) |v| clip_overrides.gamut_compression = v;
 
     const collect_all = asBool(argAt(args, arg_allmetaprops)) orelse false;
     const threads: u32 = if (asInt(argAt(args, arg_threads))) |t| std.math.cast(u32, t) orelse 0 else 0;

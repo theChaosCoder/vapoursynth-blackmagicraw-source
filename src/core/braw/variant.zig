@@ -71,19 +71,27 @@ pub const MetaValue = union(enum) {
 
 const ElemKind = enum { i, f, skip };
 
+/// Map platform variant-type codes onto the unix enumeration so every
+/// downstream switch exists exactly once.
+fn normVt(vt_raw: u32) u32 {
+    if (!is_windows) return vt_raw;
+    return switch (@as(u16, @intCast(vt_raw & 0xFFFF))) {
+        api.vt_win.empty => api.vt_unix.empty,
+        api.vt_win.u8_ => api.vt_unix.u8_,
+        api.vt_win.s16 => api.vt_unix.s16,
+        api.vt_win.u16_ => api.vt_unix.u16_,
+        api.vt_win.s32 => api.vt_unix.s32,
+        api.vt_win.u32_ => api.vt_unix.u32_,
+        api.vt_win.f32_ => api.vt_unix.f32_,
+        api.vt_win.f64_ => api.vt_unix.f64_,
+        api.vt_win.string => api.vt_unix.string,
+        api.vt_win.safe_array => api.vt_unix.safe_array,
+        else => 0xFFFF_FFFF,
+    };
+}
+
+/// The following take NORMALIZED (unix) type codes.
 fn elemInfo(vt: u32) struct { kind: ElemKind, size: usize } {
-    if (is_windows) {
-        return switch (@as(u16, @intCast(vt))) {
-            api.vt_win.u8_ => .{ .kind = .i, .size = 1 },
-            api.vt_win.s16 => .{ .kind = .i, .size = 2 },
-            api.vt_win.u16_ => .{ .kind = .i, .size = 2 },
-            api.vt_win.s32 => .{ .kind = .i, .size = 4 },
-            api.vt_win.u32_ => .{ .kind = .i, .size = 4 },
-            api.vt_win.f32_ => .{ .kind = .f, .size = 4 },
-            api.vt_win.f64_ => .{ .kind = .f, .size = 8 },
-            else => .{ .kind = .skip, .size = 0 },
-        };
-    }
     return switch (vt) {
         api.vt_unix.u8_ => .{ .kind = .i, .size = 1 },
         api.vt_unix.s16 => .{ .kind = .i, .size = 2 },
@@ -97,16 +105,6 @@ fn elemInfo(vt: u32) struct { kind: ElemKind, size: usize } {
 }
 
 fn elemToI64(vt: u32, p: [*]const u8) i64 {
-    if (is_windows) {
-        return switch (@as(u16, @intCast(vt))) {
-            api.vt_win.u8_ => p[0],
-            api.vt_win.s16 => std.mem.readInt(i16, p[0..2], .little),
-            api.vt_win.u16_ => std.mem.readInt(u16, p[0..2], .little),
-            api.vt_win.s32 => std.mem.readInt(i32, p[0..4], .little),
-            api.vt_win.u32_ => std.mem.readInt(u32, p[0..4], .little),
-            else => 0,
-        };
-    }
     return switch (vt) {
         api.vt_unix.u8_ => p[0],
         api.vt_unix.s16 => std.mem.readInt(i16, p[0..2], .little),
@@ -118,8 +116,7 @@ fn elemToI64(vt: u32, p: [*]const u8) i64 {
 }
 
 fn elemToF64(vt: u32, p: [*]const u8) f64 {
-    const is_f32 = if (is_windows) vt == api.vt_win.f32_ else vt == api.vt_unix.f32_;
-    if (is_f32) return @as(f32, @bitCast(std.mem.readInt(u32, p[0..4], .little)));
+    if (vt == api.vt_unix.f32_) return @as(f32, @bitCast(std.mem.readInt(u32, p[0..4], .little)));
     return @bitCast(std.mem.readInt(u64, p[0..8], .little));
 }
 
@@ -131,7 +128,7 @@ fn safeArrayToMeta(gpa: std.mem.Allocator, lib: *loader.Lib, sa: *api.SafeArray)
     if (is_windows) {
         var vt16: u16 = 0;
         if (ole.SafeArrayGetVartype(sa, &vt16) != api.S_OK) return .empty;
-        elem_vt = vt16;
+        elem_vt = normVt(vt16);
         count = sa.rgsabound[0].cElements;
         if (ole.SafeArrayAccessData(sa, &data) != api.S_OK) return .empty;
     } else {
@@ -167,27 +164,13 @@ fn safeArrayToMeta(gpa: std.mem.Allocator, lib: *loader.Lib, sa: *api.SafeArray)
 /// Convert a Variant into an owned MetaValue. Does NOT clear the variant;
 /// callers pair this with variantInit/variantClear.
 pub fn toMeta(gpa: std.mem.Allocator, lib: *loader.Lib, v: *api.Variant) !MetaValue {
-    const vt: u32 = v.vt;
-    if (is_windows) {
-        const w: u16 = @intCast(vt);
-        if (w & api.vt_win.vt_array_flag != 0 or w == api.vt_win.safe_array) {
-            const sa = v.u.parray orelse return .empty;
-            return try safeArrayToMeta(gpa, lib, sa);
-        }
-        return switch (w) {
-            api.vt_win.empty => .empty,
-            api.vt_win.u8_ => .{ .int = @as(u8, @intCast(v.u.uiVal & 0xff)) },
-            api.vt_win.s16 => .{ .int = v.u.iVal },
-            api.vt_win.u16_ => .{ .int = v.u.uiVal },
-            api.vt_win.s32 => .{ .int = v.u.intVal },
-            api.vt_win.u32_ => .{ .int = v.u.uintVal },
-            api.vt_win.f32_ => .{ .float = v.u.fltVal },
-            api.vt_win.f64_ => .{ .float = v.u.dblVal },
-            api.vt_win.string => .{ .string = try strings.dupe(gpa, v.u.bstrVal, false) },
-            else => .empty,
-        };
+    // Windows-only: arrays may arrive as VT_ARRAY|<elem> instead of
+    // VT_SAFEARRAY; fold that onto the common safe-array path.
+    if (is_windows and (@as(u16, @intCast(v.vt)) & api.vt_win.vt_array_flag) != 0) {
+        const sa = v.u.parray orelse return .empty;
+        return try safeArrayToMeta(gpa, lib, sa);
     }
-    return switch (vt) {
+    return switch (normVt(v.vt)) {
         api.vt_unix.empty => .empty,
         api.vt_unix.u8_ => .{ .int = @as(u8, @truncate(v.u.uiVal)) },
         api.vt_unix.s16 => .{ .int = v.u.iVal },

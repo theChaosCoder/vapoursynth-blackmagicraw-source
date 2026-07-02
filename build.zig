@@ -1,5 +1,52 @@
 const std = @import("std");
 
+fn addVsLib(
+    b: *std.Build,
+    core_mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const vs_dep = b.dependency("vapoursynth", .{ .target = target, .optimize = optimize });
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/vapoursynth/plugin.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("vapoursynth", vs_dep.module("vapoursynth"));
+    mod.addImport("core", core_mod);
+    mod.link_libc = true;
+    return b.addLibrary(.{ .name = "brawsource", .linkage = .dynamic, .root_module = mod });
+}
+
+fn addAvsLib(
+    b: *std.Build,
+    core_mod: *std.Build.Module,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    // AviSynth+ target is fixed: Windows x64
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu });
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/avisynth/plugin.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("core", core_mod);
+    mod.link_libc = true;
+    mod.addIncludePath(b.path("vendor/avisynth_sdk"));
+    mod.addIncludePath(b.path("src/avisynth"));
+    mod.addCSourceFile(.{
+        .file = b.path("src/avisynth/avs_loader.c"),
+        .flags = &.{"-DAVSC_NO_DECLSPEC"},
+    });
+    const lib = b.addLibrary(.{ .name = "BRAWSource", .linkage = .dynamic, .root_module = mod });
+    lib.win32_module_definition = b.path("src/avisynth/exports.def");
+    return lib;
+}
+
+fn installTo(b: *std.Build, lib: *std.Build.Step.Compile, dir: []const u8) *std.Build.Step.InstallArtifact {
+    return b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .{ .custom = dir } } });
+}
+
 pub fn build(b: *std.Build) void {
     var target = b.standardTargetOptions(.{});
     // On linux-gnu, always link zig's bundled glibc instead of the system
@@ -38,53 +85,21 @@ pub fn build(b: *std.Build) void {
     const probe = b.addExecutable(.{ .name = "braw-probe", .root_module = probe_mod });
     b.installArtifact(probe);
 
-    // --- VapourSynth plugin ---
+    // --- plugins (separate install dirs: the AviSynth DLL differs from the
+    // VS one only by case, which collides on Windows filesystems) ---
     const build_vs = b.option(bool, "vs", "Build the VapourSynth plugin") orelse true;
     var vs_lib_step: ?*std.Build.Step.Compile = null;
     if (build_vs) {
-        const vs_dep = b.dependency("vapoursynth", .{ .target = target, .optimize = optimize });
-        const vs_mod = b.createModule(.{
-            .root_source_file = b.path("src/vapoursynth/plugin.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        vs_mod.addImport("vapoursynth", vs_dep.module("vapoursynth"));
-        vs_mod.addImport("core", core_mod);
-        vs_mod.link_libc = true;
-        const vs_lib = b.addLibrary(.{ .name = "brawsource", .linkage = .dynamic, .root_module = vs_mod });
-        // separate dirs: the AviSynth DLL differs from the VS one only by
-        // case, which collides on Windows filesystems
-        const vs_install = b.addInstallArtifact(vs_lib, .{ .dest_dir = .{ .override = .{ .custom = "vapoursynth" } } });
-        b.getInstallStep().dependOn(&vs_install.step);
+        const vs_lib = addVsLib(b, core_mod, target, optimize);
+        b.getInstallStep().dependOn(&installTo(b, vs_lib, "vapoursynth").step);
         vs_lib_step = vs_lib;
     }
 
-    // --- AviSynth+ plugin (Windows x64 only) ---
     const build_avs = b.option(bool, "avs", "Build the AviSynth plugin (win x64)") orelse true;
     var avs_lib_step: ?*std.Build.Step.Compile = null;
     if (build_avs) {
-        const avs_target = b.resolveTargetQuery(.{
-            .cpu_arch = .x86_64,
-            .os_tag = .windows,
-            .abi = .gnu,
-        });
-        const avs_mod = b.createModule(.{
-            .root_source_file = b.path("src/avisynth/plugin.zig"),
-            .target = avs_target,
-            .optimize = optimize,
-        });
-        avs_mod.addImport("core", core_mod);
-        avs_mod.link_libc = true;
-        avs_mod.addIncludePath(b.path("vendor/avisynth_sdk"));
-        avs_mod.addIncludePath(b.path("src/avisynth"));
-        avs_mod.addCSourceFile(.{
-            .file = b.path("src/avisynth/avs_loader.c"),
-            .flags = &.{"-DAVSC_NO_DECLSPEC"},
-        });
-        const avs_lib = b.addLibrary(.{ .name = "BRAWSource", .linkage = .dynamic, .root_module = avs_mod });
-        avs_lib.win32_module_definition = b.path("src/avisynth/exports.def");
-        const avs_install = b.addInstallArtifact(avs_lib, .{ .dest_dir = .{ .override = .{ .custom = "avisynth" } } });
-        b.getInstallStep().dependOn(&avs_install.step);
+        const avs_lib = addAvsLib(b, core_mod, optimize);
+        b.getInstallStep().dependOn(&installTo(b, avs_lib, "avisynth").step);
         avs_lib_step = avs_lib;
     }
 
@@ -98,45 +113,16 @@ pub fn build(b: *std.Build) void {
     // --- release matrix: all shipped targets, ReleaseFast ---
     const release_targets = [_]struct { q: std.Target.Query, label: []const u8 }{
         // glibc pinned old for broad distro compatibility (dlopen only)
-        .{ .q = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 17, .patch = 0 } }, .label = "vapoursynth-linux-x86_64" },
-        .{ .q = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }, .label = "vapoursynth-windows-x86_64" },
-        .{ .q = .{ .cpu_arch = .x86_64, .os_tag = .macos }, .label = "vapoursynth-macos-x86_64" },
-        .{ .q = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .label = "vapoursynth-macos-arm64" },
+        .{ .q = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 17, .patch = 0 } }, .label = "release/vapoursynth-linux-x86_64" },
+        .{ .q = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }, .label = "release/vapoursynth-windows-x86_64" },
+        .{ .q = .{ .cpu_arch = .x86_64, .os_tag = .macos }, .label = "release/vapoursynth-macos-x86_64" },
+        .{ .q = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .label = "release/vapoursynth-macos-arm64" },
     };
     const release = b.step("release", "Build all release artifacts (ReleaseFast)");
     for (release_targets) |rt| {
-        const rtarget = b.resolveTargetQuery(rt.q);
-        const vs_dep = b.dependency("vapoursynth", .{ .target = rtarget, .optimize = .ReleaseFast });
-        const rmod = b.createModule(.{
-            .root_source_file = b.path("src/vapoursynth/plugin.zig"),
-            .target = rtarget,
-            .optimize = .ReleaseFast,
-        });
-        rmod.addImport("vapoursynth", vs_dep.module("vapoursynth"));
-        rmod.addImport("core", core_mod);
-        rmod.link_libc = true;
-        const rlib = b.addLibrary(.{ .name = "brawsource", .linkage = .dynamic, .root_module = rmod });
-        const inst = b.addInstallArtifact(rlib, .{ .dest_dir = .{ .override = .{ .custom = b.fmt("release/{s}", .{rt.label}) } } });
-        release.dependOn(&inst.step);
+        const rlib = addVsLib(b, core_mod, b.resolveTargetQuery(rt.q), .ReleaseFast);
+        release.dependOn(&installTo(b, rlib, rt.label).step);
     }
-    {
-        const avs_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu });
-        const rmod = b.createModule(.{
-            .root_source_file = b.path("src/avisynth/plugin.zig"),
-            .target = avs_target,
-            .optimize = .ReleaseFast,
-        });
-        rmod.addImport("core", core_mod);
-        rmod.link_libc = true;
-        rmod.addIncludePath(b.path("vendor/avisynth_sdk"));
-        rmod.addIncludePath(b.path("src/avisynth"));
-        rmod.addCSourceFile(.{
-            .file = b.path("src/avisynth/avs_loader.c"),
-            .flags = &.{"-DAVSC_NO_DECLSPEC"},
-        });
-        const rlib = b.addLibrary(.{ .name = "BRAWSource", .linkage = .dynamic, .root_module = rmod });
-        rlib.win32_module_definition = b.path("src/avisynth/exports.def");
-        const inst = b.addInstallArtifact(rlib, .{ .dest_dir = .{ .override = .{ .custom = "release/avisynth-windows-x86_64" } } });
-        release.dependOn(&inst.step);
-    }
+    const avs_release = addAvsLib(b, core_mod, .ReleaseFast);
+    release.dependOn(&installTo(b, avs_release, "release/avisynth-windows-x86_64").step);
 }

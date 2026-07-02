@@ -33,6 +33,38 @@ pub const Depth = enum {
     }
 };
 
+pub const DepthSelectError = error{
+    BadFormatString,
+    NoFloat8,
+    BadBitdepth,
+    FpRequiresBitdepth,
+};
+
+/// Resolve the user-facing depth selection (shared by both adapters):
+/// `bitdepth` 8/16/32 with optional `fp` is the primary API, `format`
+/// ("auto"/"u8"/"u16"/"f16"/"f32") the legacy alias; bitdepth wins.
+/// Returns null for automatic selection.
+pub fn resolveDepth(format_str: ?[]const u8, bitdepth: ?i64, fp: ?bool) DepthSelectError!?Depth {
+    var depth: ?Depth = null;
+    if (format_str) |s| {
+        if (!std.ascii.eqlIgnoreCase(s, "auto")) {
+            depth = Depth.parse(s) orelse return error.BadFormatString;
+        }
+    }
+    if (bitdepth) |b| {
+        const want_fp = fp orelse false;
+        depth = switch (b) {
+            8 => if (want_fp) return error.NoFloat8 else .u8_,
+            16 => if (want_fp) .f16 else .u16_,
+            32 => .f32_,
+            else => return error.BadBitdepth,
+        };
+    } else if (fp != null) {
+        return error.FpRequiresBitdepth;
+    }
+    return depth;
+}
+
 /// Pick the SDK resource format for a depth/alpha combination.
 /// u8 has no planar variant, so it is always interleaved RGBA.
 /// The CPU pipeline rejects the f16 formats (E_INVALIDARG, GPU-only), so
@@ -90,37 +122,25 @@ pub fn copyImage(fmt: api.ResourceFormat, src: [*]const u8, src_size: u64, dst: 
     if (src_size < expectedSizeBytes(fmt, dst.width, dst.height)) return error.SizeMismatch;
     const narrow_f16 = dst_depth == .f16;
     switch (fmt) {
-        .rgb_u16_planar => copyPlanar(u16, src, dst),
-        .rgb_f16_planar => copyPlanar(u16, src, dst), // f16 bits, no interpretation needed
-        .rgb_f32_planar => if (narrow_f16) copyPlanarF32ToF16(src, dst) else copyPlanar(u32, src, dst),
-        .rgba_u8 => deinterleave(u8, src, dst),
-        .rgba_u16 => deinterleave(u16, src, dst),
-        .rgba_f16 => deinterleave(u16, src, dst),
-        .rgba_f32 => if (narrow_f16) deinterleaveF32ToF16(src, dst) else deinterleave(u32, src, dst),
+        .rgb_u16_planar => copyPlanar(u16, u16, src, dst),
+        .rgb_f16_planar => copyPlanar(u16, u16, src, dst), // f16 bits, no interpretation needed
+        .rgb_f32_planar => if (narrow_f16) copyPlanar(f32, f16, src, dst) else copyPlanar(u32, u32, src, dst),
+        .rgba_u8 => deinterleave(u8, u8, src, dst),
+        .rgba_u16 => deinterleave(u16, u16, src, dst),
+        .rgba_f16 => deinterleave(u16, u16, src, dst),
+        .rgba_f32 => if (narrow_f16) deinterleave(f32, f16, src, dst) else deinterleave(u32, u32, src, dst),
         else => return error.UnsupportedFormat,
     }
 }
 
-fn copyPlanar(comptime T: type, src: [*]const u8, dst: *const Dest) void {
-    const w: usize = dst.width;
-    const h: usize = dst.height;
-    const row_bytes = w * @sizeOf(T);
-    var plane: usize = 0;
-    while (plane < 3) : (plane += 1) {
-        const dp = dst.planes[plane] orelse continue;
-        const stride = dst.strides[plane];
-        const base = src + plane * row_bytes * h;
-        var y: usize = 0;
-        while (y < h) : (y += 1) {
-            @memcpy(dp[y * stride ..][0..row_bytes], base[y * row_bytes ..][0..row_bytes]);
-        }
-    }
+inline fn convert(comptime Src: type, comptime Dst: type, v: Src) Dst {
+    return if (Src == Dst) v else @floatCast(v);
 }
 
-fn copyPlanarF32ToF16(src_raw: [*]const u8, dst: *const Dest) void {
+fn copyPlanar(comptime Src: type, comptime Dst: type, src_raw: [*]const u8, dst: *const Dest) void {
     const w: usize = dst.width;
     const h: usize = dst.height;
-    const src: [*]align(1) const f32 = @ptrCast(src_raw);
+    const src: [*]align(1) const Src = @ptrCast(src_raw);
     var plane: usize = 0;
     while (plane < 3) : (plane += 1) {
         const dp = dst.planes[plane] orelse continue;
@@ -129,38 +149,24 @@ fn copyPlanarF32ToF16(src_raw: [*]const u8, dst: *const Dest) void {
         var y: usize = 0;
         while (y < h) : (y += 1) {
             const row = base + y * w;
-            const out: [*]align(1) f16 = @ptrCast(dp + y * stride);
-            var x: usize = 0;
-            while (x < w) : (x += 1) {
-                out[x] = @floatCast(row[x]);
+            if (Src == Dst) {
+                const row_bytes = w * @sizeOf(Src);
+                @memcpy(dp[y * stride ..][0..row_bytes], @as([*]const u8, @ptrCast(row))[0..row_bytes]);
+            } else {
+                const out: [*]align(1) Dst = @ptrCast(dp + y * stride);
+                var x: usize = 0;
+                while (x < w) : (x += 1) {
+                    out[x] = convert(Src, Dst, row[x]);
+                }
             }
         }
     }
 }
 
-fn deinterleaveF32ToF16(src_raw: [*]const u8, dst: *const Dest) void {
+fn deinterleave(comptime Src: type, comptime Dst: type, src_raw: [*]const u8, dst: *const Dest) void {
     const w: usize = dst.width;
     const h: usize = dst.height;
-    const src: [*]align(1) const f32 = @ptrCast(src_raw);
-    var y: usize = 0;
-    while (y < h) : (y += 1) {
-        const row = src + y * w * 4;
-        var c: usize = 0;
-        while (c < 4) : (c += 1) {
-            const dp = dst.planes[c] orelse continue;
-            const out: [*]align(1) f16 = @ptrCast(dp + y * dst.strides[c]);
-            var x: usize = 0;
-            while (x < w) : (x += 1) {
-                out[x] = @floatCast(row[x * 4 + c]);
-            }
-        }
-    }
-}
-
-fn deinterleave(comptime T: type, src_raw: [*]const u8, dst: *const Dest) void {
-    const w: usize = dst.width;
-    const h: usize = dst.height;
-    const src: [*]align(1) const T = @ptrCast(src_raw);
+    const src: [*]align(1) const Src = @ptrCast(src_raw);
     const nch: usize = 4;
 
     var y: usize = 0;
@@ -169,10 +175,10 @@ fn deinterleave(comptime T: type, src_raw: [*]const u8, dst: *const Dest) void {
         var c: usize = 0;
         while (c < 4) : (c += 1) {
             const dp = dst.planes[c] orelse continue;
-            const out: [*]align(1) T = @ptrCast(dp + y * dst.strides[c]);
+            const out: [*]align(1) Dst = @ptrCast(dp + y * dst.strides[c]);
             var x: usize = 0;
             while (x < w) : (x += 1) {
-                out[x] = row[x * nch + c];
+                out[x] = convert(Src, Dst, row[x * nch + c]);
             }
         }
     }
@@ -193,6 +199,20 @@ fn testDest(comptime T: type, w: u32, h: u32, bufs: *[4][]T, want_alpha: bool) D
         d.strides[i] = w * @sizeOf(T) + 8; // deliberately padded stride
     }
     return d;
+}
+
+test "resolveDepth: bitdepth wins, errors on bad input" {
+    try std.testing.expectEqual(@as(?Depth, null), try resolveDepth(null, null, null));
+    try std.testing.expectEqual(@as(?Depth, null), try resolveDepth("auto", null, null));
+    try std.testing.expectEqual(@as(?Depth, .f32_), try resolveDepth(null, 32, null));
+    try std.testing.expectEqual(@as(?Depth, .f16), try resolveDepth(null, 16, true));
+    try std.testing.expectEqual(@as(?Depth, .u8_), try resolveDepth(null, 8, false));
+    try std.testing.expectEqual(@as(?Depth, .u16_), try resolveDepth("f32", 16, null)); // bitdepth wins
+    try std.testing.expectEqual(@as(?Depth, .f32_), try resolveDepth("f32", null, null));
+    try std.testing.expectError(error.NoFloat8, resolveDepth(null, 8, true));
+    try std.testing.expectError(error.BadBitdepth, resolveDepth(null, 12, null));
+    try std.testing.expectError(error.FpRequiresBitdepth, resolveDepth(null, null, true));
+    try std.testing.expectError(error.BadFormatString, resolveDepth("yuv", null, null));
 }
 
 test "planar u16 copy respects stride" {

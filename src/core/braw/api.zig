@@ -298,6 +298,44 @@ pub const Variant = if (is_windows) extern struct {
     pub const empty: @This() = .{ .vt = vt_unix.empty, .u = .{ .dblVal = 0 } };
 };
 
+// Typed Variant constructors: the vt code differs per platform (OLE VT_*
+// vs the SDK's own enumeration), so pairing tag and union member lives
+// here exactly once.
+pub fn variantU16(x: u16) Variant {
+    var v: Variant = .empty;
+    v.vt = if (is_windows) vt_win.u16_ else vt_unix.u16_;
+    v.u = .{ .uiVal = x };
+    return v;
+}
+
+pub fn variantU32(x: u32) Variant {
+    var v: Variant = .empty;
+    v.vt = if (is_windows) vt_win.u32_ else vt_unix.u32_;
+    v.u = .{ .uintVal = x };
+    return v;
+}
+
+pub fn variantI16(x: i16) Variant {
+    var v: Variant = .empty;
+    v.vt = if (is_windows) vt_win.s16 else vt_unix.s16;
+    v.u = .{ .iVal = x };
+    return v;
+}
+
+pub fn variantF32(x: f32) Variant {
+    var v: Variant = .empty;
+    v.vt = if (is_windows) vt_win.f32_ else vt_unix.f32_;
+    v.u = .{ .fltVal = x };
+    return v;
+}
+
+pub fn variantString(raw: StringRaw) Variant {
+    var v: Variant = .empty;
+    v.vt = if (is_windows) vt_win.string else vt_unix.string;
+    v.u = .{ .bstrVal = raw };
+    return v;
+}
+
 comptime {
     if (is_windows) {
         std.debug.assert(@sizeOf(Variant) == 24);
@@ -306,6 +344,15 @@ comptime {
         std.debug.assert(@sizeOf(SafeArray) == 24);
     }
     std.debug.assert(@sizeOf(Guid) == 16);
+}
+
+test "variant constructors pair tag and member" {
+    const v = variantU32(6870);
+    try std.testing.expectEqual(@as(u32, 6870), v.u.uintVal);
+    const expect_vt: u32 = if (is_windows) vt_win.u32_ else vt_unix.u32_;
+    try std.testing.expectEqual(expect_vt, @as(u32, v.vt));
+    const t = variantI16(-20);
+    try std.testing.expectEqual(@as(i16, -20), t.u.iVal);
 }
 
 // ---------------------------------------------------------------------------
