@@ -415,9 +415,18 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
     const collect_all = map_in.getBool("allmetaprops") orelse false;
     const libpath = map_in.getData("libpath", 0);
 
+    var pipeline: core_mod.decoder.Pipeline = .cpu;
+    if (map_in.getData("pipeline", 0)) |p| {
+        pipeline = core_mod.decoder.Pipeline.parse(p) orelse {
+            map_out.setError("braw.Source: 'pipeline' must be 'cpu' or 'cuda'");
+            return;
+        };
+    }
+
     const dec = openFromMap(vsapi, core, map_out, "braw.Source", source, .{
         .libpath = libpath,
         .threads = threads,
+        .pipeline = pipeline,
         .depth = depth,
         .alpha = alpha,
         .scale = scale,
@@ -496,7 +505,7 @@ export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI
     );
     ZAPI.Plugin.function(
         "Source",
-        "source:data;bitdepth:int:opt;fp:int:opt;alpha:int:opt;scale:int:opt;" ++
+        "source:data;bitdepth:int:opt;fp:int:opt;pipeline:data:opt;alpha:int:opt;scale:int:opt;" ++
             "kelvin:int:opt;tint:int:opt;exposure:float:opt;iso:int:opt;" ++
             "gamma:data:opt;gamut:data:opt;colorscience:int:opt;" ++
             "highlightrecovery:int:opt;gamutcompression:int:opt;" ++

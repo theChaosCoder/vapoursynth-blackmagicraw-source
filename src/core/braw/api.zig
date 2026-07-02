@@ -434,9 +434,9 @@ pub const IBlackmagicRawConfiguration = extern struct {
     const Self = @This();
     pub const VTable = extern struct {
         unknown: UnknownVt(),
-        setPipeline: UnusedSlot,
+        setPipeline: *const fn (*Self, Pipeline, ?*anyopaque, ?*anyopaque) callconv(.c) HRESULT,
         getPipeline: UnusedSlot,
-        isPipelineSupported: UnusedSlot,
+        isPipelineSupported: *const fn (*Self, Pipeline, *bool) callconv(.c) HRESULT,
         setCPUThreads: *const fn (*Self, u32) callconv(.c) HRESULT,
         getCPUThreads: *const fn (*Self, *u32) callconv(.c) HRESULT,
         getMaxCPUThreadCount: *const fn (*Self, *u32) callconv(.c) HRESULT,

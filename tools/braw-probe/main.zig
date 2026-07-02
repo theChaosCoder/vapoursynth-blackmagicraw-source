@@ -41,6 +41,8 @@ const Args = struct {
     scale: core.decoder.Scale = .full,
     all_meta: bool = false,
     list_attrs: bool = false,
+    pipeline: core.decoder.Pipeline = .cpu,
+    bench: u32 = 0,
     audio_out: ?[]const u8 = null,
 };
 
@@ -76,6 +78,10 @@ fn parseArgs(args: std.process.Args, gpa: std.mem.Allocator) Args {
             a.all_meta = true;
         } else if (std.mem.eql(u8, arg, "--list-attrs")) {
             a.list_attrs = true;
+        } else if (std.mem.eql(u8, arg, "--pipeline")) {
+            a.pipeline = core.decoder.Pipeline.parse(nextValue(&it)) orelse fatal("pipeline must be cpu|cuda", .{});
+        } else if (std.mem.eql(u8, arg, "--bench")) {
+            a.bench = std.fmt.parseInt(u32, nextValue(&it), 10) catch fatal("bad --bench", .{});
         } else if (std.mem.eql(u8, arg, "--audio")) {
             a.audio_out = keep(gpa, nextValue(&it));
         } else if (std.mem.startsWith(u8, arg, "--")) {
@@ -95,6 +101,50 @@ fn printProps(w: *std.Io.Writer, label: []const u8, list: *const core.meta.PropL
     }
 }
 
+/// Decode `--bench` frames single-threaded (each decodeFrame is synchronous),
+/// cycling through the clip, into a reused destination. Reports fps for the
+/// selected pipeline. Includes a small warmup that is excluded from timing.
+fn runBench(gpa: std.mem.Allocator, w: *std.Io.Writer, dec: *core.Decoder, a: Args) !void {
+    const info = dec.info;
+    const width = info.out_width;
+    const height = info.out_height;
+    const bps = a.depth.bytesPerSample();
+    const stride: usize = @as(usize, width) * bps;
+    var bufs: [3][]u8 = undefined;
+    for (0..3) |i| bufs[i] = try gpa.alloc(u8, stride * height);
+    defer for (0..3) |i| gpa.free(bufs[i]);
+    const dest: core.formats.Dest = .{
+        .width = width,
+        .height = height,
+        .planes = .{ bufs[0].ptr, bufs[1].ptr, bufs[2].ptr, null },
+        .strides = .{ stride, stride, stride, stride },
+    };
+
+    const fc = info.frame_count;
+    var fm: core.FrameMeta = .{};
+    defer fm.deinit(gpa);
+    // warmup
+    var wi: u64 = 0;
+    while (wi < @min(fc, 4)) : (wi += 1) {
+        dec.decodeFrame(wi, &dest, &fm) catch {};
+    }
+
+    const t0 = nowMs();
+    var done: u32 = 0;
+    var i: u32 = 0;
+    while (i < a.bench) : (i += 1) {
+        const n = @as(u64, i) % fc;
+        dec.decodeFrame(n, &dest, &fm) catch |e| fatal("bench decode failed: {t} ({s})", .{ e, fm.fail_stage });
+        done += 1;
+    }
+    const t1 = nowMs();
+    const sec = @as(f64, @floatFromInt(t1 - t0)) / 1000.0;
+    try w.print("\nbench [{t}]: {d} frames in {d:.3}s = {d:.2} fps ({d}x{d}, {t})\n", .{
+        a.pipeline, done, sec, @as(f64, @floatFromInt(done)) / sec, width, height, a.depth,
+    });
+    if (dec.cuda_ctx) |*ctx| try w.print("  GPU: {s}\n", .{ctx.name()});
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -109,6 +159,7 @@ pub fn main(init: std.process.Init) !void {
     var err_detail: ?[]u8 = null;
     const dec = core.Decoder.open(gpa, clip_path, .{
         .libpath = a.libpath,
+        .pipeline = a.pipeline,
         .depth = a.depth,
         .alpha = a.alpha,
         .scale = a.scale,
@@ -158,6 +209,11 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     try w.flush();
+
+    if (a.bench > 0) {
+        try runBench(gpa, w, dec, a);
+        try w.flush();
+    }
 
     if (a.frame) |n| {
         const t0 = nowMs();

@@ -7,6 +7,7 @@ pub const api = @import("braw/api.zig");
 pub const strings = @import("braw/strings.zig");
 pub const variant = @import("braw/variant.zig");
 pub const loader = @import("braw/loader.zig");
+pub const cuda = @import("braw/cuda.zig");
 pub const formats = @import("formats.zig");
 pub const meta = @import("meta.zig");
 pub const decoder = @import("decoder.zig");

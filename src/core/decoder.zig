@@ -15,6 +15,7 @@ pub const api = @import("braw/api.zig");
 const strings = @import("braw/strings.zig");
 const variant = @import("braw/variant.zig");
 const loader = @import("braw/loader.zig");
+const cuda = @import("braw/cuda.zig");
 const formats = @import("formats.zig");
 const meta = @import("meta.zig");
 const sync = @import("sync.zig");
@@ -109,10 +110,22 @@ pub fn clipOverridesFromParams(
     return o;
 }
 
+pub const Pipeline = enum {
+    cpu,
+    cuda,
+
+    pub fn parse(s: []const u8) ?Pipeline {
+        if (std.ascii.eqlIgnoreCase(s, "cpu")) return .cpu;
+        if (std.ascii.eqlIgnoreCase(s, "cuda")) return .cuda;
+        return null;
+    }
+};
+
 pub const OpenOptions = struct {
     libpath: ?[]const u8 = null,
     plugin_dir: ?[]const u8 = null,
     threads: u32 = 0,
+    pipeline: Pipeline = .cpu,
     /// null = automatic: 16-bit integer, except 32-bit float when the
     /// effective gamma is "Linear" (scene-linear values exceed 1.0 and
     /// would clip in integer formats).
@@ -157,6 +170,8 @@ pub const OpenError = error{
     CodecFailed,
     OpenClipFailed,
     InvalidProcessingAttribute,
+    CudaUnavailable,
+    PipelineUnsupported,
     OutOfMemory,
 };
 
@@ -357,7 +372,25 @@ fn cbProcessComplete(_: *anyopaque, job: *api.IBlackmagicRawJob, hr: api.HRESULT
         return;
     }
 
-    formats.copyImage(got_fmt, @ptrCast(resource.?), size_bytes, dest, req.decoder.depth) catch |e| {
+    // On the GPU pipeline the resource lives in device memory: read it back
+    // into a pinned host staging buffer (from the pool) before the copy.
+    var host_src: [*]const u8 = @ptrCast(resource.?);
+    var staging: ?[]u8 = null;
+    defer if (staging) |s| req.decoder.releasePinned(s);
+    if (req.decoder.cuda_ctx) |*ctx| {
+        const buf = req.decoder.acquirePinned(size_bytes) catch {
+            req.oom = true;
+            return;
+        };
+        staging = buf;
+        ctx.readback(buf.ptr, @intFromPtr(resource.?), size_bytes) catch {
+            req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH)");
+            return;
+        };
+        host_src = buf.ptr;
+    }
+
+    formats.copyImage(got_fmt, host_src, size_bytes, dest, req.decoder.depth) catch |e| {
         req.fail(api.E_FAIL, switch (e) {
             error.SizeMismatch => "resource size mismatch (padded buffer?)",
             error.UnsupportedFormat => "unsupported resource format",
@@ -562,6 +595,13 @@ pub const Decoder = struct {
     submit_mutex: sync.Mutex = .{},
     audio_mutex: sync.Mutex = .{},
 
+    // GPU pipeline: CUDA context + a pool of pinned host staging buffers for
+    // the device->host readback (allocating pinned memory per frame is slow).
+    pipeline: Pipeline,
+    cuda_ctx: ?cuda.Context = null,
+    pinned_pool: std.ArrayList([]u8) = .empty,
+    pinned_mutex: sync.Mutex = .{},
+
     depth: formats.Depth,
     alpha: bool,
     scale: Scale,
@@ -610,6 +650,7 @@ pub const Decoder = struct {
             .audio_if = null,
             .clip_attrs = null,
             .callback = .{ .v = &callback_vtable, .decoder = self },
+            .pipeline = opts.pipeline,
             // provisional when depth is auto; finalized in collectClipInfo
             // once the effective gamma is known
             .depth = opts.depth orelse .u16_,
@@ -632,11 +673,33 @@ pub const Decoder = struct {
             self.codec.flushJobs();
             api.release(self.codec);
         }
+        errdefer if (self.cuda_ctx) |*ctx| ctx.destroy();
 
-        if (opts.threads > 0) {
-            if (api.queryInterface(self.codec, api.IBlackmagicRawConfiguration, &api.iid_configuration)) |cfg| {
-                defer api.release(cfg);
-                _ = cfg.v.setCPUThreads(cfg, opts.threads);
+        // configuration is read at the first OpenClip, so pipeline + threads
+        // must be set beforehand
+        if (opts.threads > 0 or opts.pipeline != .cpu) {
+            const cfg = api.queryInterface(self.codec, api.IBlackmagicRawConfiguration, &api.iid_configuration) orelse {
+                if (opts.pipeline != .cpu) return error.PipelineUnsupported;
+                return error.FactoryFailed;
+            };
+            defer api.release(cfg);
+
+            if (opts.threads > 0) _ = cfg.v.setCPUThreads(cfg, opts.threads);
+
+            if (opts.pipeline == .cuda) {
+                self.cuda_ctx = cuda.Context.create() catch |e| {
+                    err_detail.* = std.fmt.allocPrint(gpa, "CUDA pipeline requested but unavailable: {s}", .{@errorName(e)}) catch null;
+                    return error.CudaUnavailable;
+                };
+                var supported = false;
+                _ = cfg.v.isPipelineSupported(cfg, .cuda, &supported);
+                if (!supported) {
+                    err_detail.* = std.fmt.allocPrint(gpa, "the BlackmagicRaw CUDA decoder is not available (libDecoderCUDA missing?)", .{}) catch null;
+                    return error.PipelineUnsupported;
+                }
+                if (cfg.v.setPipeline(cfg, .cuda, self.cuda_ctx.?.handle, null) != api.S_OK) {
+                    return error.PipelineUnsupported;
+                }
             }
         }
 
@@ -843,6 +906,27 @@ pub const Decoder = struct {
         };
     }
 
+    // --- pinned host staging pool (GPU readback) ---
+
+    fn acquirePinned(self: *Decoder, size: u32) ![]u8 {
+        const ctx = &self.cuda_ctx.?;
+        self.pinned_mutex.lock();
+        defer self.pinned_mutex.unlock();
+        while (self.pinned_pool.pop()) |buf| {
+            if (buf.len >= size) return buf;
+            ctx.freePinned(buf); // stale (smaller) buffer; drop it
+        }
+        return ctx.allocPinned(size) catch error.OutOfMemory;
+    }
+
+    fn releasePinned(self: *Decoder, buf: []u8) void {
+        self.pinned_mutex.lock();
+        defer self.pinned_mutex.unlock();
+        self.pinned_pool.append(self.gpa, buf) catch {
+            self.cuda_ctx.?.freePinned(buf);
+        };
+    }
+
     pub fn close(self: *Decoder) void {
         const gpa = self.gpa;
         self.codec.flushJobs();
@@ -852,6 +936,11 @@ pub const Decoder = struct {
         api.release(self.clip);
         api.release(self.codec);
         api.release(self.factory);
+        if (self.cuda_ctx) |*ctx| {
+            for (self.pinned_pool.items) |buf| ctx.freePinned(buf);
+            self.pinned_pool.deinit(gpa);
+            ctx.destroy();
+        }
         loader.release(self.lib);
         if (self.camera_type.len > 0) gpa.free(self.camera_type);
         self.clip_props.deinit(gpa);
