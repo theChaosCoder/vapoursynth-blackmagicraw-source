@@ -69,4 +69,8 @@ tools/extract-sdk.sh       # unpack SDK/runtime into third_party/ (dev/tests)
 
 Plugin code: see LICENSE. Vendored SDK headers (`vendor/`) are Copyright
 Blackmagic Design, license in their file headers. The Blackmagic RAW
-runtime libraries are not distributed with this plugin.
+runtime ("API Libraries") is explicitly redistributable together with
+software built on the SDK (Blackmagic RAW SDK Developer License §1.1(d)),
+so plugin bundles may ship it in the `blackmagic_*_deps` folder. This
+repository just doesn't vendor the binaries — `tools/extract-sdk.sh`
+unpacks them locally, or take them from a Blackmagic RAW install.
