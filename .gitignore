@@ -1,0 +1,12 @@
+.zig-cache/
+zig-out/
+third_party/
+encode_test/
+SDK-Sources/
+Video_samples/
+__pycache__/
+*.ppm
+*.raw
+*.wav
+test/oracle/bin/
+zig-pkg/

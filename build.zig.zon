@@ -1,0 +1,19 @@
+.{
+    .name = .brawsource,
+    .version = "0.1.0-beta",
+    .fingerprint = 0x330bc738e85d77ed,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .vapoursynth = .{
+            .url = "git+https://github.com/dnjulek/vapoursynth-zig.git#7554e4f46950771cc77bc5c1fc3bc6bbb5a2ea40",
+            .hash = "vapoursynth-4.0.0-jLYMQ-x9AgClniFnbUL4sxq9Iqx0sSTUwXC8-JHbQjIE",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tools/braw-probe",
+        "vendor",
+    },
+}
