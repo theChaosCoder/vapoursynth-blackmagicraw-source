@@ -10,3 +10,4 @@ __pycache__/
 *.wav
 test/oracle/bin/
 zig-pkg/
+.DS_Store
