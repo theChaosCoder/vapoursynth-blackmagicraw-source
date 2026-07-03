@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Multi-threaded plugin benchmark: CPU vs CUDA pipeline via VapourSynth.
+"""Multi-threaded plugin benchmark: CPU vs GPU pipeline via VapourSynth.
 
 Requests every frame through VapourSynth's threaded prefetch (real plugin
 usage: several decodeFrame calls run concurrently, so the SDK has jobs in
-flight). Sweeps VS thread counts and reports fps per pipeline.
+flight). Sweeps VS thread counts and reports fps per pipeline. The GPU
+pipeline is picked per platform: CUDA on Linux/Windows, Metal on macOS.
 
     encode_test/.venv/bin/python test/bench/bench_vs.py [clip.braw]
 """
@@ -14,8 +15,18 @@ from pathlib import Path
 import vapoursynth as vs
 
 REPO = Path(__file__).resolve().parent.parent.parent
-PLUGIN = REPO / "zig-out/vapoursynth/libbrawsource.so"
-LIBPATH = REPO / "third_party/braw/runtime/linux-x86_64"
+if sys.platform == "darwin":
+    PLUGIN = REPO / "zig-out/vapoursynth/libbrawsource.dylib"
+    LIBPATH = REPO / "third_party/braw/runtime/macos-universal"
+    GPU_PIPELINE = "metal"
+elif sys.platform == "win32":
+    PLUGIN = REPO / "zig-out/vapoursynth/brawsource.dll"
+    LIBPATH = REPO / "third_party/braw/runtime/windows-x86_64"
+    GPU_PIPELINE = "cuda"
+else:
+    PLUGIN = REPO / "zig-out/vapoursynth/libbrawsource.so"
+    LIBPATH = REPO / "third_party/braw/runtime/linux-x86_64"
+    GPU_PIPELINE = "cuda"
 DEFAULT_CLIP = REPO / "third_party/samples/Blackmagic_RAW_Note_Suwanchote_Wedding_Portrait/A054_08251201_C159.braw"
 
 core = vs.core
@@ -46,7 +57,7 @@ def main():
     print(f"clip: {clip_path.name}  {info.width}x{info.height}  {info.num_frames} frames x{LOOPS}")
     print(f"{'pipeline':<8} {'threads':>7} {'frames':>7} {'time':>8} {'fps':>8}")
     results = {}
-    for pipeline in ("cpu", "cuda"):
+    for pipeline in ("cpu", GPU_PIPELINE):
         for threads in (1, 3, 6, 12):
             try:
                 count, dt, fps = bench(pipeline, threads)
@@ -57,10 +68,10 @@ def main():
             results[(pipeline, threads)] = fps
     # summary
     cpu_best = max((v for k, v in results.items() if k[0] == "cpu"), default=0)
-    cuda_best = max((v for k, v in results.items() if k[0] == "cuda"), default=0)
-    if cpu_best and cuda_best:
-        print(f"\nbest CPU: {cpu_best:.1f} fps   best CUDA: {cuda_best:.1f} fps   "
-              f"speedup: {cuda_best / cpu_best:.2f}x")
+    gpu_best = max((v for k, v in results.items() if k[0] == GPU_PIPELINE), default=0)
+    if cpu_best and gpu_best:
+        print(f"\nbest CPU: {cpu_best:.1f} fps   best {GPU_PIPELINE.upper()}: {gpu_best:.1f} fps   "
+              f"speedup: {gpu_best / cpu_best:.2f}x")
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ fn parseArgs(args: std.process.Args, gpa: std.mem.Allocator) Args {
         } else if (std.mem.eql(u8, arg, "--list-attrs")) {
             a.list_attrs = true;
         } else if (std.mem.eql(u8, arg, "--pipeline")) {
-            a.pipeline = core.decoder.Pipeline.parse(nextValue(&it)) orelse fatal("pipeline must be cpu|cuda", .{});
+            a.pipeline = core.decoder.Pipeline.parse(nextValue(&it)) orelse fatal("pipeline must be cpu|cuda|metal", .{});
         } else if (std.mem.eql(u8, arg, "--bench")) {
             a.bench = std.fmt.parseInt(u32, nextValue(&it), 10) catch fatal("bad --bench", .{});
         } else if (std.mem.eql(u8, arg, "--audio")) {

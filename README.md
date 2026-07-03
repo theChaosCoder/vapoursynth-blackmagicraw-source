@@ -39,7 +39,7 @@ Parameters (both frameworks):
 | `alpha` | add alpha (constant opaque; `_Alpha` frame in VS, 4th plane in AviSynth) |
 | `audio` | AviSynth only: attach audio track (default true) |
 | `scale` | decode at 1/2/4/8 resolution |
-| `pipeline` | decode on `cpu` (default), `cuda` (NVIDIA, Linux/Windows) or `metal` (Apple GPU, macOS). GPU helps mainly at high resolution; see `doc/cuda-benchmark.md` |
+| `pipeline` | decode on `cpu` (default), `cuda` (NVIDIA, Linux/Windows) or `metal` (Apple GPU, macOS). On Apple Silicon `metal` is ~2x faster and leaves the CPU nearly idle; CUDA helps mainly at high resolution. See `doc/gpu-benchmark.md` |
 | `kelvin, tint, exposure, iso` | per-frame processing overrides |
 | `gamma, gamut, colorscience` | color science overrides (e.g. `gamma="Rec.709"`); invalid values error at open |
 | `highlightrecovery, gamutcompression` | processing toggles |

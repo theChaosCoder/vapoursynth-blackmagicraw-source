@@ -376,28 +376,36 @@ fn cbProcessComplete(_: *anyopaque, job: *api.IBlackmagicRawJob, hr: api.HRESULT
     }
 
     // On a GPU pipeline the resource lives in device memory: read it back
-    // into a host staging buffer (pooled) before the copy.
+    // through a pooled staging buffer before the copy. CUDA copies into
+    // pinned host memory; Metal blits into a managed MTLBuffer whose
+    // contents pointer feeds copyImage directly (no second host copy).
     var host_src: [*]const u8 = @ptrCast(resource.?);
-    var staging: ?[]u8 = null;
-    defer if (staging) |s| req.decoder.releasePinned(s);
-    if (req.decoder.cuda_ctx != null or req.decoder.metal_queue != null) {
+    var pinned: ?[]u8 = null;
+    defer if (pinned) |s| req.decoder.releasePinned(s);
+    var mtl_staging: ?metal.Staging = null;
+    defer if (mtl_staging) |s| req.decoder.releaseMetalStaging(s);
+    if (req.decoder.cuda_ctx) |*ctx| {
         const buf = req.decoder.acquirePinned(size_bytes) catch {
             req.oom = true;
             return;
         };
-        staging = buf;
-        if (req.decoder.cuda_ctx) |*ctx| {
-            ctx.readback(buf.ptr, @intFromPtr(resource.?), size_bytes) catch {
-                req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH)");
-                return;
-            };
-        } else {
-            metal.readback(req.decoder.metal_queue.?, resource.?, buf.ptr, size_bytes) catch {
-                req.fail(api.E_FAIL, "GPU readback (Metal blit)");
-                return;
-            };
-        }
+        pinned = buf;
+        ctx.readback(buf.ptr, @intFromPtr(resource.?), size_bytes) catch {
+            req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH)");
+            return;
+        };
         host_src = buf.ptr;
+    } else if (req.decoder.metal_queue) |queue| {
+        const stg = req.decoder.acquireMetalStaging(size_bytes) catch {
+            req.oom = true;
+            return;
+        };
+        mtl_staging = stg;
+        metal.blitInto(queue, resource.?, stg, size_bytes) catch {
+            req.fail(api.E_FAIL, "GPU readback (Metal blit)");
+            return;
+        };
+        host_src = stg.contents;
     }
 
     formats.copyImage(got_fmt, host_src, size_bytes, dest, req.decoder.depth) catch |e| {
@@ -608,12 +616,14 @@ pub const Decoder = struct {
     // GPU pipeline state. CUDA: context + a pool of pinned host staging
     // buffers for the device->host readback (pinned alloc per frame is slow).
     // Metal: the SDK pipeline device, whose MTLCommandQueue drives the blit
-    // readback; the staging buffer is Metal-managed inside metal.zig.
+    // readback into a pool of managed staging MTLBuffers (a full-res frame
+    // is tens of MB; allocating one per frame is slow).
     pipeline: Pipeline,
     cuda_ctx: ?cuda.Context = null,
     metal_device: ?*api.IBlackmagicRawPipelineDevice = null,
     metal_queue: ?*anyopaque = null,
     pinned_pool: std.ArrayList([]u8) = .empty,
+    metal_pool: std.ArrayList(metal.Staging) = .empty,
     pinned_mutex: sync.Mutex = .{},
 
     depth: formats.Depth,
@@ -963,10 +973,9 @@ pub const Decoder = struct {
         self.metal_queue = queue_out;
     }
 
-    // --- host staging pool (GPU readback) ---
-    // CUDA uses pinned host memory (faster DtoH); Metal copies into plain
-    // host memory. Either way buffers are pooled since per-frame allocation
-    // is wasteful.
+    // --- staging pools (GPU readback) ---
+    // CUDA pools pinned host buffers (faster DtoH, pinned alloc is slow);
+    // Metal pools managed MTLBuffers (blit destination, read in place).
 
     fn allocStaging(self: *Decoder, size: usize) ![]u8 {
         if (self.cuda_ctx) |*ctx| return ctx.allocPinned(size) catch error.OutOfMemory;
@@ -995,6 +1004,24 @@ pub const Decoder = struct {
         };
     }
 
+    fn acquireMetalStaging(self: *Decoder, size: u32) !metal.Staging {
+        self.pinned_mutex.lock();
+        defer self.pinned_mutex.unlock();
+        while (self.metal_pool.pop()) |stg| {
+            if (stg.len >= size) return stg;
+            metal.destroyStaging(stg); // stale (smaller) buffer; drop it
+        }
+        return metal.createStaging(self.metal_queue.?, size) catch error.OutOfMemory;
+    }
+
+    fn releaseMetalStaging(self: *Decoder, stg: metal.Staging) void {
+        self.pinned_mutex.lock();
+        defer self.pinned_mutex.unlock();
+        self.metal_pool.append(self.gpa, stg) catch {
+            metal.destroyStaging(stg);
+        };
+    }
+
     pub fn close(self: *Decoder) void {
         const gpa = self.gpa;
         self.codec.flushJobs();
@@ -1003,11 +1030,14 @@ pub const Decoder = struct {
         if (self.clip_ex) |e| api.release(e);
         api.release(self.clip);
         api.release(self.codec);
-        // drain the staging pool with the right free (pinned vs gpa) before
-        // the CUDA context is destroyed
-        if (self.cuda_ctx != null or self.metal_queue != null) {
+        // drain the staging pools before their backing context goes away
+        if (self.cuda_ctx != null) {
             for (self.pinned_pool.items) |buf| self.freeStaging(buf);
             self.pinned_pool.deinit(gpa);
+        }
+        if (self.metal_queue != null) {
+            for (self.metal_pool.items) |stg| metal.destroyStaging(stg);
+            self.metal_pool.deinit(gpa);
         }
         if (self.cuda_ctx) |*ctx| ctx.destroy();
         if (self.metal_device) |d| api.release(d);

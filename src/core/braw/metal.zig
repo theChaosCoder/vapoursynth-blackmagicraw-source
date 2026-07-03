@@ -5,12 +5,16 @@
 //!
 //! The SDK's Metal pipeline produces the decoded frame as a PRIVATE MTLBuffer
 //! (GPU-only). To read it on the CPU we blit it into a managed staging buffer
-//! and copy out its contents — mirroring the ProcessClipMetal SDK sample. On
-//! Apple Silicon the blit is on-chip (unified memory), far cheaper than a
-//! discrete GPU's PCIe readback, but still required.
+//! (pooled by the decoder — a 4.6K frame is 68 MB, allocating one per frame
+//! is expensive) and read its contents pointer directly — mirroring the
+//! ProcessClipMetal SDK sample. On Apple Silicon the blit is on-chip (unified
+//! memory), far cheaper than a discrete GPU's PCIe readback, but still
+//! required.
 //!
-//! NOTE: implemented against the SDK sample and the Metal/objc ABI; it builds
-//! for the macOS target but is UNTESTED on real hardware (no Mac available).
+//! Verified on Apple Silicon (M1 Pro, macOS 26): device iteration with
+//! interop `none`, managed staging + synchronizeResource, and the
+//! objc_msgSend signatures below all behave as the SDK sample implies;
+//! decoded frames match the CPU pipeline to within GPU/CPU rounding.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -128,32 +132,50 @@ inline fn sendCopy(o: *const Objc, recv: Id, sel: Sel, src: Id, so: usize, dst: 
 
 pub const Error = error{ MetalUnavailable, ReadbackFailed };
 
-/// Blit a private MTLBuffer (`src_buffer`, from the SDK) into a managed
-/// staging buffer via `command_queue` (also from the SDK) and copy its
-/// `size` bytes to `dst`. Wrapped in an autorelease pool since the command
-/// buffer / encoder are autoreleased.
-pub fn readback(command_queue: *anyopaque, src_buffer: *anyopaque, dst: [*]u8, size: usize) Error!void {
+/// A reusable managed staging buffer (retained MTLBuffer + its CPU-visible
+/// contents pointer, which is stable for the buffer's lifetime).
+pub const Staging = struct {
+    buffer: *anyopaque,
+    contents: [*]const u8,
+    len: usize,
+};
+
+/// Allocate a managed staging buffer of `size` bytes on `command_queue`'s
+/// device. The result is retained; pair with `destroyStaging`.
+pub fn createStaging(command_queue: *anyopaque, size: usize) Error!Staging {
     const o = get() orelse return error.MetalUnavailable;
     const pool = o.poolPush();
     defer o.poolPop(pool);
 
-    const cq: Id = command_queue;
-    const src: Id = src_buffer;
-
-    const device = send0(o, cq, o.sel_device) orelse return error.ReadbackFailed;
-    const staging = sendBuf(o, device, o.sel_newBuffer, size, MTLResourceStorageModeManaged) orelse
+    const device = send0(o, command_queue, o.sel_device) orelse return error.ReadbackFailed;
+    const buf = sendBuf(o, device, o.sel_newBuffer, size, MTLResourceStorageModeManaged) orelse
         return error.ReadbackFailed;
-    defer send0v(o, staging, o.sel_release);
+    const contents = send0(o, buf, o.sel_contents) orelse {
+        send0v(o, buf, o.sel_release);
+        return error.ReadbackFailed;
+    };
+    return .{ .buffer = buf, .contents = @ptrCast(contents), .len = size };
+}
 
-    const cb = send0(o, cq, o.sel_commandBuffer) orelse return error.ReadbackFailed;
+pub fn destroyStaging(s: Staging) void {
+    const o = get() orelse return;
+    send0v(o, s.buffer, o.sel_release);
+}
+
+/// Blit `size` bytes from a private MTLBuffer (`src_buffer`, from the SDK)
+/// into `staging` via `command_queue` and wait for completion; afterwards
+/// `staging.contents` holds the pixels (no extra host copy). Wrapped in an
+/// autorelease pool since the command buffer / encoder are autoreleased.
+pub fn blitInto(command_queue: *anyopaque, src_buffer: *anyopaque, staging: Staging, size: usize) Error!void {
+    const o = get() orelse return error.MetalUnavailable;
+    const pool = o.poolPush();
+    defer o.poolPop(pool);
+
+    const cb = send0(o, command_queue, o.sel_commandBuffer) orelse return error.ReadbackFailed;
     const blit = send0(o, cb, o.sel_blitEncoder) orelse return error.ReadbackFailed;
-    sendCopy(o, blit, o.sel_copy, src, 0, staging, 0, size);
-    sendSync(o, blit, o.sel_synchronize, staging);
+    sendCopy(o, blit, o.sel_copy, src_buffer, 0, staging.buffer, 0, size);
+    sendSync(o, blit, o.sel_synchronize, staging.buffer);
     send0v(o, blit, o.sel_endEncoding);
     send0v(o, cb, o.sel_commit);
     send0v(o, cb, o.sel_waitUntil);
-
-    const contents = send0(o, staging, o.sel_contents) orelse return error.ReadbackFailed;
-    const cptr: [*]const u8 = @ptrCast(contents);
-    @memcpy(dst[0..size], cptr[0..size]);
 }
