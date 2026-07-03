@@ -118,7 +118,7 @@ pub fn copyImage(fmt: api.ResourceFormat, src: [*]const u8, src_size: u64, dst: 
         .rgb_u16_planar => copyPlanar(u16, u16, src, dst),
         .rgb_f16_planar => copyPlanar(u16, u16, src, dst), // f16 bits, no interpretation needed
         .rgb_f32_planar => if (narrow_f16) copyPlanar(f32, f16, src, dst) else copyPlanar(u32, u32, src, dst),
-        .rgba_u8 => deinterleave(u8, u8, src, dst),
+        .rgba_u8 => deinterleaveU8(src, dst),
         .rgba_u16 => deinterleave(u16, u16, src, dst),
         .rgba_f16 => deinterleave(u16, u16, src, dst),
         .rgba_f32 => if (narrow_f16) deinterleave(f32, f16, src, dst) else deinterleave(u32, u32, src, dst),
@@ -172,6 +172,43 @@ fn deinterleave(comptime Src: type, comptime Dst: type, src_raw: [*]const u8, ds
             var x: usize = 0;
             while (x < w) : (x += 1) {
                 out[x] = convert(Src, Dst, row[x * nch + c]);
+            }
+        }
+    }
+}
+
+/// SIMD de-interleave of the SDK's packed RGBA8 buffer into planar R,G,B(,A).
+/// The SDK has no planar u8 format, so 8-bit output always arrives interleaved
+/// and must be split by hand. Two wins over the generic scalar path: each
+/// 16-pixel chunk is loaded ONCE and scattered to every present plane (the old
+/// loop re-read the row once per plane), and the per-channel gather is a single
+/// `@shuffle` (pshufb-class) instead of a stride-4 scalar loop. A scalar tail
+/// handles the last <16 pixels. Channel c maps to plane c (R,G,B,A), matching
+/// the scalar path exactly.
+fn deinterleaveU8(src_raw: [*]const u8, dst: *const Dest) void {
+    const w: usize = dst.width;
+    const h: usize = dst.height;
+    // gather indices for channel 0 across 16 pixels; +c picks the other channels
+    const base: @Vector(16, i32) = .{ 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60 };
+    const simd_w = w - (w % 16);
+    var y: usize = 0;
+    while (y < h) : (y += 1) {
+        const row = src_raw + y * w * 4;
+        var x: usize = 0;
+        while (x < simd_w) : (x += 16) {
+            const chunk: @Vector(64, u8) = @as(*align(1) const @Vector(64, u8), @ptrCast(row + x * 4)).*;
+            inline for (0..4) |c| {
+                if (dst.planes[c]) |dp| {
+                    const mask = comptime base + @as(@Vector(16, i32), @splat(@as(i32, c)));
+                    const picked = @shuffle(u8, chunk, @as(@Vector(64, u8), undefined), mask);
+                    const outp = dp + y * dst.strides[c] + x;
+                    @as(*align(1) @Vector(16, u8), @ptrCast(outp)).* = picked;
+                }
+            }
+        }
+        while (x < w) : (x += 1) {
+            inline for (0..4) |c| {
+                if (dst.planes[c]) |dp| (dp + y * dst.strides[c])[x] = row[x * 4 + c];
             }
         }
     }
@@ -252,6 +289,32 @@ test "deinterleave rgba u8 with and without alpha" {
     // without alpha plane: must not crash, alpha skipped
     d.planes[3] = null;
     try copyImage(.rgba_u8, @ptrCast(&src), src.len, &d, .u8_);
+}
+
+test "deinterleaveU8 SIMD path matches scalar reference (width > 16 + remainder)" {
+    const gpa = std.testing.allocator;
+    const w: u32 = 37; // 32 pixels via SIMD (2x16), 5 via the scalar tail
+    const h: u32 = 3;
+    const src = try gpa.alloc(u8, w * h * 4);
+    defer gpa.free(src);
+    for (0..src.len) |i| src[i] = @truncate(i *% 7 +% 1); // deterministic RGBA pattern
+    const stride: usize = w + 8; // padded, like a real frame
+    var bufs: [4][]u8 = undefined;
+    for (0..4) |i| bufs[i] = try gpa.alloc(u8, stride * h);
+    defer for (0..4) |i| gpa.free(bufs[i]);
+    for (0..4) |i| @memset(bufs[i], 0xCC);
+
+    var d = testDest(u8, w, h, &bufs, false); // R,G,B planes, alpha null (production case)
+    try copyImage(.rgba_u8, src.ptr, src.len, &d, .u8_);
+
+    for (0..h) |y| {
+        for (0..w) |x| {
+            inline for (0..3) |c| {
+                try std.testing.expectEqual(src[(y * w + x) * 4 + c], bufs[c][y * d.strides[c] + x]);
+            }
+        }
+        for (w..stride) |x| try std.testing.expectEqual(@as(u8, 0xCC), bufs[0][y * d.strides[0] + x]); // padding untouched
+    }
 }
 
 test "size mismatch rejected" {
