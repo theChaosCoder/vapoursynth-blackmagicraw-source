@@ -80,22 +80,25 @@ frameserver use):
 
 | clip / resolution | CPU fps | CUDA fps | speedup |
 |---|---|---|---|
-| 4608×2592 (4.6K, u16) | 74 | 100 | **1.35×** |
-| 2304×1296 (scale=2) | 242 | 209 | 0.86× |
-| 6048×4032 (6K, u16) | 25.8 | 26.2 | **1.02×** |
+| 4608×2592 (4.6K, u16) | 107 | 174 | **1.63×** |
+| 2304×1296 (scale=2) | 334 | 362 | **1.09×** |
+| 6048×4032 (6K, u16) | 40 | 39 | 0.97× |
 
 The 6K row is the clearest illustration: the raw GPU decode is 3.9× faster
-there, yet in the plugin the two pipelines are identical (~26 fps). Each 6K
+there, yet in the plugin the two pipelines are identical (~40 fps). Each 6K
 frame is 146 MB, so allocating the VapourSynth frame and copying the decoded
 pixels into it dwarfs the decode entirely — and that cost is the same
 whether the decode ran on the CPU or GPU. The bigger the frame, the more the
 copy dominates, so the in-plugin GPU advantage *shrinks* as resolution grows
 even though the raw decode advantage grows.
 
-*(The CUDA table predates two plugin-side fixes made during the Metal
-bring-up — the parallel filter mode and the deferred plane copy, see below —
-which lifted Metal from 1.0× to 2.3×. Both also apply to CUDA, so the PC
-numbers should improve when re-measured; the raw 5× is the upper bound.)*
+*(These are the post-fix numbers. Before the two plugin-side fixes made
+during the Metal bring-up — the parallel filter mode and the deferred plane
+copy, see below — the same clips measured 74/100 (1.35×) at 4.6K, 242/209
+(0.86×) at half-res and 25.8/26.2 (1.02×) at 6K. The fixes lifted both
+pipelines together — CUDA 1.35×→1.63× at 4.6K, and from a loss to a small
+win at half-res — but the memory-bound 6K case stays at parity. The raw 5×
+standalone decode remains the upper bound.)*
 
 ## How the plugin keeps up (two fixes)
 
@@ -130,10 +133,10 @@ and allocation dominate; the CPU pipeline is already at its raw limit.
   throughput at every resolution tested *and* an almost idle CPU. The CPU
   pipeline only makes sense if the GPU is busy elsewhere.
 - **Linux/Windows + NVIDIA**: `pipeline="cuda"` is worth it when decoding
-  full-resolution BRAW **and** you want the CPU cores free for downstream
-  filters (~1.35× at 4.6K measured pre-fmParallel; likely more now). For a
-  pure source→disk pass at reduced resolution the CPU pipeline may still
-  win — re-measure.
+  full-resolution BRAW (~1.6× at 4.6K) **and** whenever you want the CPU
+  cores free for downstream filters. At reduced resolution it is now roughly
+  on par with the CPU (~1.1× at half-res), and at 6K the two are identical —
+  there the per-frame copy, not the decode, is the ceiling.
 - Neither is the default: `cpu` behaves identically everywhere.
 
 Reproduce:
