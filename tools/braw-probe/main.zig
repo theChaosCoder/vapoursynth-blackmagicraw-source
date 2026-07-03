@@ -6,7 +6,6 @@
 //!     --frame <n>        decode frame n (default: no decode)
 //!     --out <file.ppm>   write decoded frame as PPM (u8/u16) or raw floats
 //!     --depth <d>        u8 | u16 | f16 | f32 (default u16)
-//!     --alpha            request alpha
 //!     --scale <s>        1 | 2 | 4 | 8 (default 1)
 //!     --all-meta         dump every metadata key
 //!     --audio <file.raw> dump first ~2s of packed PCM to file
@@ -37,7 +36,6 @@ const Args = struct {
     frame: ?u64 = null,
     out: ?[]const u8 = null,
     depth: core.formats.Depth = .u16_,
-    alpha: bool = false,
     scale: core.decoder.Scale = .full,
     all_meta: bool = false,
     list_attrs: bool = false,
@@ -69,8 +67,6 @@ fn parseArgs(args: std.process.Args, gpa: std.mem.Allocator) Args {
             a.out = keep(gpa, nextValue(&it));
         } else if (std.mem.eql(u8, arg, "--depth")) {
             a.depth = core.formats.Depth.parse(nextValue(&it)) orelse fatal("bad --depth", .{});
-        } else if (std.mem.eql(u8, arg, "--alpha")) {
-            a.alpha = true;
         } else if (std.mem.eql(u8, arg, "--scale")) {
             const v = std.fmt.parseInt(i64, nextValue(&it), 10) catch fatal("bad --scale", .{});
             a.scale = core.decoder.Scale.fromInt(v) orelse fatal("scale must be 1|2|4|8", .{});
@@ -161,7 +157,6 @@ pub fn main(init: std.process.Init) !void {
         .libpath = a.libpath,
         .pipeline = a.pipeline,
         .depth = a.depth,
-        .alpha = a.alpha,
         .scale = a.scale,
         .collect_all_meta = a.all_meta,
     }, &err_detail) catch |e| {
@@ -220,7 +215,7 @@ pub fn main(init: std.process.Init) !void {
         const width = info.out_width;
         const height = info.out_height;
         const bps = a.depth.bytesPerSample();
-        const nplanes: usize = if (a.alpha) 4 else 3;
+        const nplanes: usize = 3;
 
         const stride: usize = @as(usize, width) * bps;
         var planes: [4]?[*]u8 = .{ null, null, null, null };
@@ -245,7 +240,7 @@ pub fn main(init: std.process.Init) !void {
         };
         const t1 = nowMs();
 
-        try w.print("\nframe {d} decoded in {d} ms ({d}x{d}, {t}{s})\n", .{ n, t1 - t0, width, height, a.depth, if (a.alpha) " + alpha" else "" });
+        try w.print("\nframe {d} decoded in {d} ms ({d}x{d}, {t})\n", .{ n, t1 - t0, width, height, a.depth });
         if (fm.timecode) |tc| try w.print("timecode:      {s}\n", .{tc});
         if (fm.sensor_rate) |sr| try w.print("sensor rate:   {d}/{d}\n", .{ sr[0], sr[1] });
         try printProps(w, "frame props", &fm.props);

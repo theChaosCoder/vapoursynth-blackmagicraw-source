@@ -36,7 +36,6 @@ Parameters (both frameworks):
 | Parameter | Description |
 |---|---|
 | `bitdepth` | 8, 16 or 32 (32 = float). Unset = auto: 16-bit, or 32-bit float for Linear gamma. `fp=true` with 16 = half float (VapourSynth only) |
-| `alpha` | add alpha (constant opaque; `_Alpha` frame in VS, 4th plane in AviSynth) |
 | `audio` | AviSynth only: attach audio track (default true) |
 | `scale` | decode at 1/2/4/8 resolution |
 | `pipeline` | decode on `cpu` (default), `cuda` (NVIDIA, Linux/Windows) or `metal` (Apple GPU, macOS). On Apple Silicon `metal` is 1.5-2.3x faster and leaves the CPU nearly idle; CUDA helps mainly at high resolution. See `doc/gpu-benchmark.md` |

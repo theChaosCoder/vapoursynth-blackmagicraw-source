@@ -15,8 +15,6 @@ const plugin_id = "com.thechaoscoder.braw";
 const SourceData = struct {
     dec: *core_mod.Decoder,
     vi: vs.VideoInfo,
-    alpha_format: vs.VideoFormat, // valid when alpha
-    alpha: bool,
     fps: core_mod.meta.Rational,
 };
 
@@ -73,15 +71,6 @@ fn sourceGetFrame(
         zapi.setFilterError("braw.Source: failed to allocate frame");
         return null;
     };
-    var alpha_frame: ?*vs.Frame = null;
-    if (d.alpha) {
-        alpha_frame = zapi.newVideoFrame(&d.alpha_format, d.vi.width, d.vi.height, null);
-        if (alpha_frame == null) {
-            zapi.freeFrame(dst);
-            zapi.setFilterError("braw.Source: failed to allocate alpha frame");
-            return null;
-        }
-    }
 
     var dest: core_mod.formats.Dest = .{
         .width = w,
@@ -90,13 +79,13 @@ fn sourceGetFrame(
             zapi.getWritePtr(dst, 0),
             zapi.getWritePtr(dst, 1),
             zapi.getWritePtr(dst, 2),
-            if (alpha_frame) |af| zapi.getWritePtr(af, 0) else null,
+            null,
         },
         .strides = .{
             @intCast(zapi.getStride(dst, 0)),
             @intCast(zapi.getStride(dst, 1)),
             @intCast(zapi.getStride(dst, 2)),
-            if (alpha_frame) |af| @intCast(zapi.getStride(af, 0)) else 0,
+            0,
         },
     };
 
@@ -104,7 +93,6 @@ fn sourceGetFrame(
     defer fm.deinit(allocator);
     d.dec.decodeFrame(@intCast(n), &dest, &fm) catch |e| {
         zapi.freeFrame(dst);
-        if (alpha_frame) |af| zapi.freeFrame(af);
         var buf: [512]u8 = undefined;
         zapi.setFilterError(core_mod.decoder.formatDecodeError(&buf, "braw.Source", e, n, &fm));
         return null;
@@ -138,12 +126,6 @@ fn sourceGetFrame(
     propSetList(&zapi, props_map, &d.dec.clip_props_all);
     propSetList(&zapi, props_map, &fm.props);
     propSetList(&zapi, props_map, &fm.props_all);
-
-    if (alpha_frame) |af| {
-        const aprops = zapi.initZMap(zapi.getFramePropertiesRW(af));
-        aprops.setInt("_Range", 1, .Replace);
-        props.setAlpha(af);
-    }
 
     return dst;
 }
@@ -382,7 +364,6 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
         map_out.setError(depthErrorMsg("braw.Source", e));
         return;
     };
-    const alpha = map_in.getBool("alpha") orelse false;
     var scale: core_mod.decoder.Scale = .full;
     if (map_in.getInt(i64, "scale")) |s| {
         scale = core_mod.decoder.Scale.fromInt(s) orelse {
@@ -428,7 +409,6 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
         .threads = threads,
         .pipeline = pipeline,
         .depth = depth,
-        .alpha = alpha,
         .scale = scale,
         .collect_all_meta = collect_all,
         .frame_overrides = frame_overrides,
@@ -466,15 +446,6 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
         map_out.setError("braw.Source: video format rejected by core");
         return;
     }
-    var af: vs.VideoFormat = undefined;
-    if (alpha) {
-        if (zapi.queryVideoFormat(&af, .Gray, sample_type, bits, 0, 0) == 0) {
-            dec.close();
-            allocator.destroy(d);
-            map_out.setError("braw.Source: alpha format rejected by core");
-            return;
-        }
-    }
 
     d.* = .{
         .dec = dec,
@@ -486,8 +457,6 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
             .height = @intCast(info.out_height),
             .numFrames = @intCast(info.frame_count),
         },
-        .alpha_format = if (alpha) af else undefined,
-        .alpha = alpha,
         .fps = info.fps,
     };
 
@@ -509,7 +478,7 @@ export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI
     );
     ZAPI.Plugin.function(
         "Source",
-        "source:data;bitdepth:int:opt;fp:int:opt;pipeline:data:opt;alpha:int:opt;scale:int:opt;" ++
+        "source:data;bitdepth:int:opt;fp:int:opt;pipeline:data:opt;scale:int:opt;" ++
             "kelvin:int:opt;tint:int:opt;exposure:float:opt;iso:int:opt;" ++
             "gamma:data:opt;gamut:data:opt;colorscience:int:opt;" ++
             "highlightrecovery:int:opt;gamutcompression:int:opt;" ++

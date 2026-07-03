@@ -74,7 +74,6 @@ fn loadApi() void {
 
 const FilterData = struct {
     dec: *core_mod.Decoder,
-    alpha: bool,
     fps: core_mod.meta.Rational,
     bit_depth: u32,
     channels: u32,
@@ -168,7 +167,7 @@ fn getFrame(fi_opt: [*c]FI, n: c_int) callconv(cc) ?*VF {
         .planes = .{ null, null, null, null },
         .strides = .{ 0, 0, 0, 0 },
     };
-    const nplanes: usize = if (d.alpha) 4 else 3;
+    const nplanes: usize = 3;
     for (0..nplanes) |i| {
         dest.planes[i] = api.get_write_ptr_p(frame, planes[i]);
         dest.strides[i] = @intCast(api.get_pitch_p(frame, planes[i]));
@@ -258,24 +257,23 @@ fn freeFilter(fi_opt: [*c]FI) callconv(cc) void {
 const arg_source = 0;
 const arg_bitdepth = 1;
 const arg_fp = 2;
-const arg_alpha = 3;
-const arg_audio = 4;
-const arg_scale = 5;
-const arg_kelvin = 6;
-const arg_tint = 7;
-const arg_exposure = 8;
-const arg_iso = 9;
-const arg_gamma = 10;
-const arg_gamut = 11;
-const arg_colorscience = 12;
-const arg_highlightrecovery = 13;
-const arg_gamutcompression = 14;
-const arg_allmetaprops = 15;
-const arg_threads = 16;
-const arg_libpath = 17;
+const arg_audio = 3;
+const arg_scale = 4;
+const arg_kelvin = 5;
+const arg_tint = 6;
+const arg_exposure = 7;
+const arg_iso = 8;
+const arg_gamma = 9;
+const arg_gamut = 10;
+const arg_colorscience = 11;
+const arg_highlightrecovery = 12;
+const arg_gamutcompression = 13;
+const arg_allmetaprops = 14;
+const arg_threads = 15;
+const arg_libpath = 16;
 
 const params_string =
-    "s[bitdepth]i[fp]b[alpha]b[audio]b[scale]i[kelvin]i[tint]i[exposure]f[iso]i" ++
+    "s[bitdepth]i[fp]b[audio]b[scale]i[kelvin]i[tint]i[exposure]f[iso]i" ++
     "[gamma]s[gamut]s[colorscience]i[highlightrecovery]b[gamutcompression]b" ++
     "[allmetaprops]b[threads]i[libpath]s";
 
@@ -304,7 +302,6 @@ export fn bsrc_create_impl(env: ?*Env, args: *const Val, out: *Val, user_data: ?
             return;
         }
     }
-    const alpha = asBool(argAt(args, arg_alpha)) orelse false;
     const want_audio = asBool(argAt(args, arg_audio)) orelse true;
 
     var scale: core_mod.decoder.Scale = .full;
@@ -359,7 +356,6 @@ export fn bsrc_create_impl(env: ?*Env, args: *const Val, out: *Val, user_data: ?
         .plugin_dir = plugin_dir,
         .threads = threads,
         .depth = depth,
-        .alpha = alpha,
         .scale = scale,
         .collect_all_meta = collect_all,
         .frame_overrides = frame_overrides,
@@ -406,7 +402,6 @@ export fn bsrc_create_impl(env: ?*Env, args: *const Val, out: *Val, user_data: ?
 
     d.* = .{
         .dec = dec,
-        .alpha = alpha,
         .fps = info.fps,
         .bit_depth = if (au_info) |au| au.bit_depth else 0,
         .channels = if (au_info) |au| au.channels else 0,
@@ -420,9 +415,9 @@ export fn bsrc_create_impl(env: ?*Env, args: *const Val, out: *Val, user_data: ?
     f.vi.fps_denominator = @intCast(info.fps.den);
     f.vi.num_frames = @intCast(info.frame_count);
     f.vi.pixel_type = switch (dec.depth) {
-        .u8_ => if (alpha) c.AVS_CS_RGBAP else c.AVS_CS_RGBP,
-        .u16_ => if (alpha) c.AVS_CS_RGBAP16 else c.AVS_CS_RGBP16,
-        .f32_ => if (alpha) c.AVS_CS_RGBAPS else c.AVS_CS_RGBPS,
+        .u8_ => c.AVS_CS_RGBP,
+        .u16_ => c.AVS_CS_RGBP16,
+        .f32_ => c.AVS_CS_RGBPS,
         // auto never resolves to f16; explicit f16 was rejected above
         .f16 => unreachable,
     };

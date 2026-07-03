@@ -2,9 +2,9 @@
 //! frame planes.
 //!
 //! The SDK decodes into tightly packed buffers (verified at runtime against
-//! GetResourceSizeBytes). Without alpha we request the *planar* RGB variants
-//! and do straight row copies; with alpha only interleaved RGBA exists, so
-//! rows are de-interleaved. Plane order for planar formats is R, G, B.
+//! GetResourceSizeBytes). The 16/32-bit depths use the *planar* RGB variants
+//! and do straight row copies; u8 has no planar variant, so it decodes as
+//! interleaved RGBA and is de-interleaved into R, G, B. Plane order is R, G, B.
 
 const std = @import("std");
 const api = @import("braw/api.zig");
@@ -56,16 +56,17 @@ pub fn resolveDepth(bitdepth: ?i64, fp: ?bool) DepthSelectError!?Depth {
     return null;
 }
 
-/// Pick the SDK resource format for a depth/alpha combination.
-/// u8 has no planar variant, so it is always interleaved RGBA.
+/// Pick the SDK resource format for a depth. BRAW has no alpha channel, so
+/// the output is always RGB. u8 has no planar variant, so it decodes as
+/// interleaved RGBA (the padding channel is dropped during the plane copy).
 /// The CPU pipeline rejects the f16 formats (E_INVALIDARG, GPU-only), so
 /// f16 output decodes as f32 and is converted during the plane copy.
-pub fn resourceFormat(depth: Depth, alpha: bool) api.ResourceFormat {
+pub fn resourceFormat(depth: Depth) api.ResourceFormat {
     return switch (depth) {
         .u8_ => .rgba_u8,
-        .u16_ => if (alpha) .rgba_u16 else .rgb_u16_planar,
-        .f16 => if (alpha) .rgba_f32 else .rgb_f32_planar,
-        .f32_ => if (alpha) .rgba_f32 else .rgb_f32_planar,
+        .u16_ => .rgb_u16_planar,
+        .f16 => .rgb_f32_planar,
+        .f32_ => .rgb_f32_planar,
     };
 }
 
@@ -96,8 +97,9 @@ pub fn expectedSizeBytes(fmt: api.ResourceFormat, w: u32, h: u32) u64 {
     return @as(u64, w) * h * channelCount(fmt) * sampleBytes(fmt);
 }
 
-/// Destination description: up to 4 planes (R, G, B, A). A null alpha plane
-/// with an alpha-carrying source skips the alpha channel. Strides in bytes.
+/// Destination description: R, G, B planes. The 4th slot exists only because
+/// the u8 path decodes as interleaved RGBA; it is always null, so the padding
+/// channel is skipped during de-interleave. Strides in bytes.
 pub const Dest = struct {
     width: u32,
     height: u32,

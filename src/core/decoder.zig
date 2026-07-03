@@ -138,7 +138,6 @@ pub const OpenOptions = struct {
     /// effective gamma is "Linear" (scene-linear values exceed 1.0 and
     /// would clip in integer formats).
     depth: ?formats.Depth = null,
-    alpha: bool = false,
     scale: Scale = .full,
     collect_all_meta: bool = false,
     frame_overrides: FrameOverrides = .{},
@@ -641,7 +640,6 @@ pub const Decoder = struct {
     pinned_mutex: sync.Mutex = .{},
 
     depth: formats.Depth,
-    alpha: bool,
     scale: Scale,
     resource_format: api.ResourceFormat,
     collect_all_meta: bool,
@@ -692,9 +690,8 @@ pub const Decoder = struct {
             // provisional when depth is auto; finalized in collectClipInfo
             // once the effective gamma is known
             .depth = opts.depth orelse .u16_,
-            .alpha = opts.alpha,
             .scale = opts.scale,
-            .resource_format = formats.resourceFormat(opts.depth orelse .u16_, opts.alpha),
+            .resource_format = formats.resourceFormat(opts.depth orelse .u16_),
             .collect_all_meta = opts.collect_all_meta,
             .frame_overrides = opts.frame_overrides,
             .info = undefined,
@@ -931,7 +928,7 @@ pub const Decoder = struct {
         // automatic depth: 16-bit int, except scene-linear -> 32-bit float
         if (opts.depth == null) {
             self.depth = if (std.mem.eql(u8, eff_gamma, "Linear")) .f32_ else .u16_;
-            self.resource_format = formats.resourceFormat(self.depth, self.alpha);
+            self.resource_format = formats.resourceFormat(self.depth);
         }
 
         self.info = .{
