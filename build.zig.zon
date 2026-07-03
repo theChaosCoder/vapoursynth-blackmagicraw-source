@@ -1,6 +1,6 @@
 .{
     .name = .brawsource,
-    .version = "0.2.0-beta",
+    .version = "0.2.1-beta",
     .fingerprint = 0x330bc738e85d77ed,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
