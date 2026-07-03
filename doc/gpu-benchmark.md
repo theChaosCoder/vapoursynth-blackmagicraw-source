@@ -38,23 +38,27 @@ pipelined, 6 jobs in flight, reused staging buffer):
 | 4.6K (4608×2592, u16) | 80 fps | 202 fps (**2.5×**) | 342 fps (4.3×) |
 | 6K (6048×4032, u16) | 32 fps | 86 fps (**2.7×**) | 155 fps (4.8×) |
 
-**In the plugin, via VapourSynth** (`test/bench/bench_vs.py`):
+**In the plugin, via VapourSynth** (`test/bench/bench_vs.py`, best thread
+count):
 
 | clip / resolution | CPU fps | Metal fps | speedup |
 |---|---|---|---|
-| 4608×2592 (4.6K, u16) | 48 | 95 | **1.99×** |
-| 2304×1296 (scale=2) | 177 | 208 | **1.18×** |
-| 6048×4032 (6K, u16) | 22.4 | 41.3 | **1.84×** |
+| 4608×2592 (4.6K, u16) | 81 | 185 | **2.28×** |
+| 2304×1296 (scale=2) | 271 | 441 | **1.63×** |
+| 6048×4032 (6K, u16) | 32 | 49 | **1.55×** |
 
-And the CPU is left nearly idle: at 4.6K the CPU pipeline burns ~120 ms of
-CPU time per frame (~5 cores busy), the Metal pipeline ~21 ms (~1.7 cores) —
-**~6× less CPU work at 2× the throughput**, so the cores stay free for
-downstream filters.
+At 4.6K both pipelines run at ~90 % of their raw standalone decode rate —
+the plugin adds almost no overhead anymore (see "How the plugin keeps up"
+below). And the CPU is left nearly idle with Metal: at 4.6K the CPU pipeline
+burns ~120 ms of CPU time per frame (~5 cores busy), the Metal pipeline
+~21 ms — **~6× less CPU work at 2× the throughput**, so the cores stay free
+for downstream filters.
 
 Two properties of Apple Silicon make Metal a clear win where CUDA isn't:
 the readback blit stays on-chip (unified memory, no PCIe round-trip), and
 the M1 CPU decode is comparatively slow (~80 fps vs ~110 on the Ryzen).
-Even at half resolution — where CUDA loses to the CPU — Metal stays ahead.
+Even at half resolution — where CUDA lost to the CPU in the pre-parallel
+measurements — Metal stays well ahead.
 
 ## Results — CUDA (RTX 3080, discrete, PCIe)
 
@@ -88,30 +92,48 @@ whether the decode ran on the CPU or GPU. The bigger the frame, the more the
 copy dominates, so the in-plugin GPU advantage *shrinks* as resolution grows
 even though the raw decode advantage grows.
 
-*(The CUDA numbers above predate the staging-pool rework that lifted Metal
-from 1.0× to 2× in-plugin; the CUDA path always pooled its pinned buffers,
-so its numbers should stand, but re-measuring on the PC would confirm.)*
+*(The CUDA table predates two plugin-side fixes made during the Metal
+bring-up — the parallel filter mode and the deferred plane copy, see below —
+which lifted Metal from 1.0× to 2.3×. Both also apply to CUDA, so the PC
+numbers should improve when re-measured; the raw 5× is the upper bound.)*
 
-## Where the remaining ceiling is
+## How the plugin keeps up (two fixes)
 
-The SDK delivers job-completion callbacks serially, and the plugin does its
-per-frame heavy lifting (GPU readback + plane copy into the VapourSynth
-frame) inside that callback. That serial section caps in-plugin throughput
-regardless of VapourSynth's thread count — which is why `bench_vs.py` shows
-flat fps across threads. Moving the plane copy out of the callback into the
-requesting thread (retaining the processed image / staging buffer until
-then) would let frame copies run in parallel and is the next optimization
-candidate if more source throughput is needed.
+Initially the plugin capped both pipelines at the latency of ONE sequential
+request (~45 fps CPU / ~95 fps Metal at 4.6K, flat across VS thread counts)
+while the raw standalone benchmarks pipelined to 80/202 fps. Two changes
+closed the gap:
+
+1. **`fmParallel` filter mode.** The source was registered `fmUnordered`,
+   which makes VapourSynth serialize `getFrame` calls — only one decode
+   request was ever in flight, so the SDK could never pipeline and extra VS
+   threads did nothing. `decodeFrame` is fully thread-safe (per-request
+   state, mutexed job submission, pooled staging), so the filter is now
+   `fmParallel`: N VS threads = N SDK jobs in flight.
+2. **Deferred plane copy.** The SDK dispatches completion callbacks
+   serially; the plugin used to do the GPU readback wait *and* the 68 MB
+   plane copy inside `ProcessComplete`, making that the serial bottleneck
+   under concurrency. The callback now only validates and parks the decoded
+   image (retained `IBlackmagicRawProcessedImage` on CPU, committed-but-not-
+   awaited blit + staging buffer on Metal, pinned buffer on CUDA) in the
+   request; the REQUESTING thread waits for the blit and copies the planes —
+   in parallel across VS worker threads.
+
+Remaining ceilings: at 4.6K both pipelines sit near their raw decode rates.
+At 6K the Metal path reaches ~57 % of raw (49 vs 86 fps) — each frame moves
+146 MB through blit, plane copy and VS frame allocation, so memory traffic
+and allocation dominate; the CPU pipeline is already at its raw limit.
 
 ## Takeaway
 
-- **macOS / Apple Silicon**: use `pipeline="metal"` for full- or
-  half-resolution decodes — ~2× the source throughput *and* an almost idle
-  CPU. The CPU pipeline only makes sense if the GPU is busy elsewhere.
+- **macOS / Apple Silicon**: use `pipeline="metal"` — 1.5–2.3× the source
+  throughput at every resolution tested *and* an almost idle CPU. The CPU
+  pipeline only makes sense if the GPU is busy elsewhere.
 - **Linux/Windows + NVIDIA**: `pipeline="cuda"` is worth it when decoding
   full-resolution BRAW **and** you want the CPU cores free for downstream
-  filters (~1.35× at 4.6K). For a pure source→disk pass, or at reduced
-  resolutions, the CPU pipeline is as fast or faster.
+  filters (~1.35× at 4.6K measured pre-fmParallel; likely more now). For a
+  pure source→disk pass at reduced resolution the CPU pipeline may still
+  win — re-measure.
 - Neither is the default: `cpu` behaves identically everywhere.
 
 Reproduce:

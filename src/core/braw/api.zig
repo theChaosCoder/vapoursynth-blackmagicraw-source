@@ -388,6 +388,10 @@ pub fn release(obj: anytype) void {
     _ = obj.v.unknown.release(@ptrCast(obj));
 }
 
+pub fn addRef(obj: anytype) void {
+    _ = obj.v.unknown.addRef(@ptrCast(obj));
+}
+
 pub const IBlackmagicRawFactory = extern struct {
     v: *const VTable,
     const Self = @This();

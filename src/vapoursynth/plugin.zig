@@ -491,7 +491,11 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
         .fps = info.fps,
     };
 
-    zapi.createVideoFilter(out_map, "Source", &d.vi, sourceGetFrame, sourceFree, .Unordered, null, d);
+    // Parallel: decodeFrame is fully thread-safe (per-request state, mutexed
+    // job submission, pooled staging) and the SDK pipelines concurrent read
+    // jobs — serializing getFrame would cap throughput at one decode's
+    // latency and idle a GPU pipeline.
+    zapi.createVideoFilter(out_map, "Source", &d.vi, sourceGetFrame, sourceFree, .Parallel, null, d);
 }
 
 export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI) void {

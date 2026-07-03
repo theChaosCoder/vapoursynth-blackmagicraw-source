@@ -7,9 +7,11 @@
 //! (GPU-only). To read it on the CPU we blit it into a managed staging buffer
 //! (pooled by the decoder — a 4.6K frame is 68 MB, allocating one per frame
 //! is expensive) and read its contents pointer directly — mirroring the
-//! ProcessClipMetal SDK sample. On Apple Silicon the blit is on-chip (unified
-//! memory), far cheaper than a discrete GPU's PCIe readback, but still
-//! required.
+//! ProcessClipMetal SDK sample. The blit is committed on the SDK callback
+//! thread (beginBlit) but awaited on the requesting thread (finishBlit), so
+//! the SDK's serial callback dispatch never blocks on the GPU. On Apple
+//! Silicon the blit is on-chip (unified memory), far cheaper than a discrete
+//! GPU's PCIe readback, but still required.
 //!
 //! Verified on Apple Silicon (M1 Pro, macOS 26): device iteration with
 //! interop `none`, managed staging + synchronizeResource, and the
@@ -51,7 +53,9 @@ const Objc = struct {
     sel_commit: Sel,
     sel_waitUntil: Sel,
     sel_contents: Sel,
+    sel_retain: Sel,
     sel_release: Sel,
+    sel_status: Sel,
 };
 
 var objc: ?Objc = null;
@@ -88,7 +92,9 @@ fn load() void {
         .sel_commit = registerName("commit"),
         .sel_waitUntil = registerName("waitUntilCompleted"),
         .sel_contents = registerName("contents"),
+        .sel_retain = registerName("retain"),
         .sel_release = registerName("release"),
+        .sel_status = registerName("status"),
     };
 }
 
@@ -124,6 +130,10 @@ inline fn sendBuf(o: *const Objc, recv: Id, sel: Sel, len: usize, opts: usize) I
 inline fn sendSync(o: *const Objc, recv: Id, sel: Sel, res: Id) void {
     const f: *const fn (Id, Sel, Id) callconv(.c) void = @ptrCast(o.msgSend);
     f(recv, sel, res);
+}
+inline fn sendUsize(o: *const Objc, recv: Id, sel: Sel) usize {
+    const f: *const fn (Id, Sel) callconv(.c) usize = @ptrCast(o.msgSend);
+    return f(recv, sel);
 }
 inline fn sendCopy(o: *const Objc, recv: Id, sel: Sel, src: Id, so: usize, dst: Id, do_: usize, sz: usize) void {
     const f: *const fn (Id, Sel, Id, usize, Id, usize, usize) callconv(.c) void = @ptrCast(o.msgSend);
@@ -162,11 +172,13 @@ pub fn destroyStaging(s: Staging) void {
     send0v(o, s.buffer, o.sel_release);
 }
 
-/// Blit `size` bytes from a private MTLBuffer (`src_buffer`, from the SDK)
-/// into `staging` via `command_queue` and wait for completion; afterwards
-/// `staging.contents` holds the pixels (no extra host copy). Wrapped in an
+/// Encode and commit a blit of `size` bytes from a private MTLBuffer
+/// (`src_buffer`, from the SDK) into `staging` — WITHOUT waiting, so the
+/// SDK's serial callback thread isn't blocked on the GPU. Returns the
+/// retained command buffer; hand it to `finishBlit` (any thread) to wait,
+/// after which `staging.contents` holds the pixels. Wrapped in an
 /// autorelease pool since the command buffer / encoder are autoreleased.
-pub fn blitInto(command_queue: *anyopaque, src_buffer: *anyopaque, staging: Staging, size: usize) Error!void {
+pub fn beginBlit(command_queue: *anyopaque, src_buffer: *anyopaque, staging: Staging, size: usize) Error!*anyopaque {
     const o = get() orelse return error.MetalUnavailable;
     const pool = o.poolPush();
     defer o.poolPop(pool);
@@ -176,6 +188,16 @@ pub fn blitInto(command_queue: *anyopaque, src_buffer: *anyopaque, staging: Stag
     sendCopy(o, blit, o.sel_copy, src_buffer, 0, staging.buffer, 0, size);
     sendSync(o, blit, o.sel_synchronize, staging.buffer);
     send0v(o, blit, o.sel_endEncoding);
+    _ = send0(o, cb, o.sel_retain); // survive the autorelease pool
     send0v(o, cb, o.sel_commit);
-    send0v(o, cb, o.sel_waitUntil);
+    return cb;
+}
+
+/// Wait for a `beginBlit` command buffer to finish and release it.
+pub fn finishBlit(cmdbuf: *anyopaque) Error!void {
+    const o = get() orelse return error.MetalUnavailable;
+    send0v(o, cmdbuf, o.sel_waitUntil);
+    const status = sendUsize(o, cmdbuf, o.sel_status);
+    send0v(o, cmdbuf, o.sel_release);
+    if (status == 5) return error.ReadbackFailed; // MTLCommandBufferStatusError
 }

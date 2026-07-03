@@ -5,8 +5,13 @@
 //! calls back on its own worker threads:
 //!   ReadComplete    -> harvest frame metadata, set format/scale, chain the
 //!                      decode+process job (same user data)
-//!   ProcessComplete -> copy pixels straight into the destination planes,
-//!                      then signal the waiting requester.
+//!   ProcessComplete -> validate the image, park it (retained image / GPU
+//!                      staging buffer) in the Request, signal the requester.
+//! The REQUESTER thread then finishes the GPU readback and copies the
+//! pixels into the destination planes (finishRequest). The SDK dispatches
+//! completion callbacks serially, so any per-frame heavy lifting done inside
+//! them caps throughput; deferring the copy lets it run in parallel across
+//! requesting threads.
 //! Callbacks touch only the Request and raw memory — never host APIs.
 //! Multiple requests may be in flight concurrently (the SDK decodes FIFO).
 
@@ -222,6 +227,18 @@ pub const FrameMeta = struct {
     }
 };
 
+/// Decoded-pixels handoff from cbProcessComplete to the requester thread:
+/// whichever fields are set were acquired by the callback and must be
+/// released by finishRequest, success or not.
+const Pending = struct {
+    image: ?*api.IBlackmagicRawProcessedImage = null, // retained (CPU pipeline: owns host_src)
+    host_src: ?[*]const u8 = null,
+    size: u32 = 0,
+    pinned: ?[]u8 = null, // CUDA: pooled pinned buffer holding the pixels
+    mtl_staging: ?metal.Staging = null,
+    mtl_cmdbuf: ?*anyopaque = null, // in-flight blit; finishBlit before touching staging
+};
+
 const Request = struct {
     decoder: *Decoder,
     gpa: std.mem.Allocator,
@@ -236,6 +253,7 @@ const Request = struct {
     hr: api.HRESULT = api.S_OK,
     fail_stage: []const u8 = "",
     oom: bool = false,
+    pending: Pending = .{},
 
     timecode: ?[:0]u8 = null,
     sensor_rate: ?[2]f64 = null,
@@ -375,46 +393,42 @@ fn cbProcessComplete(_: *anyopaque, job: *api.IBlackmagicRawJob, hr: api.HRESULT
         return;
     }
 
-    // On a GPU pipeline the resource lives in device memory: read it back
-    // through a pooled staging buffer before the copy. CUDA copies into
-    // pinned host memory; Metal blits into a managed MTLBuffer whose
-    // contents pointer feeds copyImage directly (no second host copy).
-    var host_src: [*]const u8 = @ptrCast(resource.?);
-    var pinned: ?[]u8 = null;
-    defer if (pinned) |s| req.decoder.releasePinned(s);
-    var mtl_staging: ?metal.Staging = null;
-    defer if (mtl_staging) |s| req.decoder.releaseMetalStaging(s);
+    // Don't copy here — the SDK dispatches these callbacks serially, so a
+    // per-frame plane copy would cap throughput. Park the pixels in the
+    // Request (keeping their owner alive) and let the requester thread do
+    // the readback wait + copy in finishRequest. CUDA is the exception: the
+    // DtoH copy stays here (transfers serialize on the context anyway), only
+    // the plane copy is deferred.
+    req.pending.size = size_bytes;
     if (req.decoder.cuda_ctx) |*ctx| {
         const buf = req.decoder.acquirePinned(size_bytes) catch {
             req.oom = true;
             return;
         };
-        pinned = buf;
+        req.pending.pinned = buf;
         ctx.readback(buf.ptr, @intFromPtr(resource.?), size_bytes) catch {
             req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH)");
             return;
         };
-        host_src = buf.ptr;
+        req.pending.host_src = buf.ptr;
     } else if (req.decoder.metal_queue) |queue| {
         const stg = req.decoder.acquireMetalStaging(size_bytes) catch {
             req.oom = true;
             return;
         };
-        mtl_staging = stg;
-        metal.blitInto(queue, resource.?, stg, size_bytes) catch {
+        req.pending.mtl_staging = stg;
+        req.pending.mtl_cmdbuf = metal.beginBlit(queue, resource.?, stg, size_bytes) catch {
             req.fail(api.E_FAIL, "GPU readback (Metal blit)");
             return;
         };
-        host_src = stg.contents;
+        req.pending.host_src = stg.contents;
+    } else {
+        // CPU pipeline: the resource is host memory owned by the image;
+        // retain the image until the requester has copied the planes.
+        api.addRef(image);
+        req.pending.image = image;
+        req.pending.host_src = @ptrCast(resource.?);
     }
-
-    formats.copyImage(got_fmt, host_src, size_bytes, dest, req.decoder.depth) catch |e| {
-        req.fail(api.E_FAIL, switch (e) {
-            error.SizeMismatch => "resource size mismatch (padded buffer?)",
-            error.UnsupportedFormat => "unsupported resource format",
-        });
-        return;
-    };
 }
 
 fn cbDecodeComplete(_: *anyopaque, _: *api.IBlackmagicRawJob, _: api.HRESULT) callconv(.c) void {}
@@ -1071,6 +1085,39 @@ pub const Decoder = struct {
         };
     }
 
+    /// Requester-side completion: finish the GPU readback, copy the decoded
+    /// planes into the destination, and release whatever cbProcessComplete
+    /// parked in `req.pending` — also on failure paths, so it must run for
+    /// every awaited request.
+    fn finishRequest(self: *Decoder, req: *Request) void {
+        const p = &req.pending;
+        defer {
+            if (p.pinned) |b| self.releasePinned(b);
+            if (p.mtl_staging) |s| self.releaseMetalStaging(s);
+            if (p.image) |img| api.release(img);
+            p.* = .{};
+        }
+        // Always drain an in-flight blit before the staging buffer can be
+        // pooled again, even when the request already failed.
+        if (p.mtl_cmdbuf) |cb| {
+            p.mtl_cmdbuf = null;
+            metal.finishBlit(cb) catch {
+                if (req.hr == api.S_OK) req.fail(api.E_FAIL, "GPU readback (Metal blit)");
+                return;
+            };
+        }
+        if (req.hr != api.S_OK or req.oom) return;
+        const dest = req.dest orelse return;
+        const src = p.host_src orelse return;
+
+        formats.copyImage(req.resource_format, src, p.size, dest, self.depth) catch |e| {
+            req.fail(api.E_FAIL, switch (e) {
+                error.SizeMismatch => "resource size mismatch (padded buffer?)",
+                error.UnsupportedFormat => "unsupported resource format",
+            });
+        };
+    }
+
     fn readFrameMetaOnly(self: *Decoder, n: u64, out: *FrameMeta) DecodeError!void {
         var req = Request{
             .decoder = self,
@@ -1083,6 +1130,7 @@ pub const Decoder = struct {
         };
         try self.submitRead(n, &req);
         self.waitRequest(&req);
+        self.finishRequest(&req);
         moveReqMeta(&req, out);
         if (req.oom) return error.OutOfMemory;
         if (req.hr != api.S_OK) return error.DecodeFailed;
@@ -1102,6 +1150,7 @@ pub const Decoder = struct {
         };
         try self.submitRead(n, &req);
         self.waitRequest(&req);
+        self.finishRequest(&req);
         moveReqMeta(&req, out);
         out.fail_stage = req.fail_stage;
         out.fail_hr = req.hr;
