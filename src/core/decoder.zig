@@ -227,14 +227,37 @@ pub const FrameMeta = struct {
     }
 };
 
+/// Read a boolean-ish env var (0/n/f -> false, anything else -> true).
+fn envFlag(name: [:0]const u8, default: bool) bool {
+    const v = std.c.getenv(name.ptr) orelse return default;
+    return switch (v[0]) {
+        0 => default,
+        '0', 'n', 'N', 'f', 'F' => false,
+        else => true,
+    };
+}
+
+/// Formats the CUDA-direct DtoH-into-frame path can handle: three equal-size,
+/// tightly-packed device planes copied verbatim (no de-interleave, no bit-depth
+/// conversion). u16/f16 planar qualify; f32 planar may narrow to f16 and the
+/// interleaved RGBA formats need a CPU de-interleave, so they keep the staging
+/// path.
+fn cudaDirectEligible(fmt: api.ResourceFormat) bool {
+    return switch (fmt) {
+        .rgb_u16_planar, .rgb_f16_planar => true,
+        else => false,
+    };
+}
+
 /// Decoded-pixels handoff from cbProcessComplete to the requester thread:
 /// whichever fields are set were acquired by the callback and must be
 /// released by finishRequest, success or not.
 const Pending = struct {
-    image: ?*api.IBlackmagicRawProcessedImage = null, // retained (CPU pipeline: owns host_src)
+    image: ?*api.IBlackmagicRawProcessedImage = null, // retained (CPU + CUDA-direct: owns the source)
     host_src: ?[*]const u8 = null,
     size: u32 = 0,
     pinned: ?[]u8 = null, // CUDA: pooled pinned buffer holding the pixels
+    cuda_dev: ?usize = null, // CUDA-direct: device pointer of the (planar) decoded image
     mtl_staging: ?metal.Staging = null,
     mtl_cmdbuf: ?*anyopaque = null, // in-flight blit; finishBlit before touching staging
 };
@@ -401,16 +424,26 @@ fn cbProcessComplete(_: *anyopaque, job: *api.IBlackmagicRawJob, hr: api.HRESULT
     // the plane copy is deferred.
     req.pending.size = size_bytes;
     if (req.decoder.cuda_ctx) |*ctx| {
-        const buf = req.decoder.acquirePinned(size_bytes) catch {
-            req.oom = true;
-            return;
-        };
-        req.pending.pinned = buf;
-        ctx.readback(buf.ptr, @intFromPtr(resource.?), size_bytes) catch {
-            req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH)");
-            return;
-        };
-        req.pending.host_src = buf.ptr;
+        // CUDA-direct (planar formats only): the decoded device buffer is
+        // already planar, so skip the staging buffer — retain the image to
+        // keep the device memory alive and let finishRequest DtoH each plane
+        // straight into the VS frame. Cuts host memory traffic ~3x.
+        if (req.decoder.cuda_direct and cudaDirectEligible(got_fmt)) {
+            api.addRef(image);
+            req.pending.image = image;
+            req.pending.cuda_dev = @intFromPtr(resource.?);
+        } else {
+            const buf = req.decoder.acquirePinned(size_bytes) catch {
+                req.oom = true;
+                return;
+            };
+            req.pending.pinned = buf;
+            ctx.readback(buf.ptr, @intFromPtr(resource.?), size_bytes) catch {
+                req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH)");
+                return;
+            };
+            req.pending.host_src = buf.ptr;
+        }
     } else if (req.decoder.metal_queue) |queue| {
         const stg = req.decoder.acquireMetalStaging(size_bytes) catch {
             req.oom = true;
@@ -639,6 +672,15 @@ pub const Decoder = struct {
     pinned_pool: std.ArrayList([]u8) = .empty,
     metal_pool: std.ArrayList(metal.Staging) = .empty,
     pinned_mutex: sync.Mutex = .{},
+    // CUDA-direct experiment: DtoH straight into the (already page-locked) VS
+    // frame planes, bypassing the pinned staging buffer + CPU plane copy.
+    // reg_pool caches host addresses registered via cuMemHostRegister (VS
+    // reuses frame buffers, so registration amortises). Toggled by env for A/B.
+    cuda_direct: bool = true,
+    cuda_pin: bool = true,
+    reg_pool: std.ArrayList(usize) = .empty,
+    cuda_fast: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    cuda_slow: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     depth: formats.Depth,
     alpha: bool,
@@ -689,6 +731,8 @@ pub const Decoder = struct {
             .clip_attrs = null,
             .callback = .{ .v = &callback_vtable, .decoder = self },
             .pipeline = opts.pipeline,
+            .cuda_direct = envFlag("BRAW_CUDA_DIRECT", true),
+            .cuda_pin = envFlag("BRAW_CUDA_PIN", true),
             // provisional when depth is auto; finalized in collectClipInfo
             // once the effective gamma is known
             .depth = opts.depth orelse .u16_,
@@ -1045,9 +1089,15 @@ pub const Decoder = struct {
         api.release(self.clip);
         api.release(self.codec);
         // drain the staging pools before their backing context goes away
-        if (self.cuda_ctx != null) {
+        if (self.cuda_ctx) |*ctx| {
             for (self.pinned_pool.items) |buf| self.freeStaging(buf);
             self.pinned_pool.deinit(gpa);
+            for (self.reg_pool.items) |addr| ctx.hostUnregister(@ptrFromInt(addr));
+            self.reg_pool.deinit(gpa);
+            const fast = self.cuda_fast.load(.monotonic);
+            const slow = self.cuda_slow.load(.monotonic);
+            if (self.cuda_direct and fast + slow > 0 and envFlag("BRAW_CUDA_STATS", false))
+                std.debug.print("[cuda-direct] fast={d} fallback={d} ({d:.1}% fast)\n", .{ fast, slow, 100.0 * @as(f64, @floatFromInt(fast)) / @as(f64, @floatFromInt(fast + slow)) });
         }
         if (self.metal_queue != null) {
             for (self.metal_pool.items) |stg| metal.destroyStaging(stg);
@@ -1108,6 +1158,14 @@ pub const Decoder = struct {
         }
         if (req.hr != api.S_OK or req.oom) return;
         const dest = req.dest orelse return;
+
+        // CUDA-direct: DtoH each already-planar device plane straight into the
+        // VS frame plane (no staging buffer, no CPU copy).
+        if (p.cuda_dev) |dev| {
+            self.copyCudaPlanesDirect(req, dest, dev);
+            return;
+        }
+
         const src = p.host_src orelse return;
 
         formats.copyImage(req.resource_format, src, p.size, dest, self.depth) catch |e| {
@@ -1116,6 +1174,73 @@ pub const Decoder = struct {
                 error.UnsupportedFormat => "unsupported resource format",
             });
         };
+    }
+
+    /// DtoH the three tightly-packed device planes into the VS frame planes.
+    /// Optionally page-locks each destination first (cached) so the transfer
+    /// runs at full pinned PCIe rate. Device plane size is derived from the
+    /// resource size (3 equal planes), so this is bit-depth agnostic.
+    fn copyCudaPlanesDirect(self: *Decoder, req: *Request, dest: *const formats.Dest, dev: usize) void {
+        const ctx = if (self.cuda_ctx) |*c| c else return;
+        const plane_bytes: usize = @as(usize, req.pending.size) / 3;
+        const wbytes = plane_bytes / dest.height;
+        var planes: [3]cuda.PlaneCopy = undefined;
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            const dp = dest.planes[i] orelse {
+                req.fail(api.E_FAIL, "missing destination plane");
+                return;
+            };
+            if (self.cuda_pin) self.ensureRegistered(dp, dest.strides[i] * dest.height);
+            planes[i] = .{
+                .dst = dp,
+                .dst_pitch = dest.strides[i],
+                .device_ptr = dev + i * plane_bytes,
+                .width_bytes = wbytes,
+                .height = dest.height,
+            };
+        }
+        // VS planes are separate allocations; page-sharing between two of them
+        // can leave one partly page-locked, which cuMemcpy2D rejects. On any
+        // failure fall back to the reliable pinned-staging path for this frame.
+        ctx.copyPlanesDtoH(&planes) catch {
+            _ = self.cuda_slow.fetchAdd(1, .monotonic);
+            self.cudaStagingFallback(req, dest, dev);
+            return;
+        };
+        _ = self.cuda_fast.fetchAdd(1, .monotonic);
+    }
+
+    /// Reliable path: DtoH into a pooled pinned buffer, then CPU plane copy.
+    /// Used when the direct cuMemcpy2D into (partly) unpinned VS memory fails.
+    fn cudaStagingFallback(self: *Decoder, req: *Request, dest: *const formats.Dest, dev: usize) void {
+        const ctx = if (self.cuda_ctx) |*c| c else return;
+        const size = req.pending.size;
+        const buf = self.acquirePinned(size) catch {
+            req.oom = true;
+            return;
+        };
+        defer self.releasePinned(buf);
+        ctx.readback(buf.ptr, dev, size) catch {
+            req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH fallback)");
+            return;
+        };
+        formats.copyImage(req.resource_format, buf.ptr, size, dest, self.depth) catch {
+            req.fail(api.E_FAIL, "plane copy (fallback)");
+        };
+    }
+
+    /// Page-lock a VS frame plane so DtoH into it runs at pinned PCIe rate.
+    /// Best-effort and cached: VS reuses frame buffers, so each address is
+    /// registered once and stays registered until the decoder closes.
+    fn ensureRegistered(self: *Decoder, ptr: [*]u8, size: usize) void {
+        const ctx = if (self.cuda_ctx) |*c| c else return;
+        const addr = @intFromPtr(ptr);
+        self.pinned_mutex.lock();
+        defer self.pinned_mutex.unlock();
+        for (self.reg_pool.items) |a| if (a == addr) return;
+        ctx.hostRegister(ptr, size) catch return; // fall back to pageable
+        self.reg_pool.append(self.gpa, addr) catch ctx.hostUnregister(ptr);
     }
 
     fn readFrameMetaOnly(self: *Decoder, n: u64, out: *FrameMeta) DecodeError!void {

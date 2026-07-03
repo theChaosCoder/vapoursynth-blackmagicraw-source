@@ -21,6 +21,40 @@ pub const CUdeviceptr = usize;
 const CU_CTX_SCHED_BLOCKING_SYNC: c_uint = 0x04;
 const CU_CTX_MAP_HOST: c_uint = 0x08;
 
+// CUmemorytype values used by cuMemcpy2D
+const CU_MEMORYTYPE_HOST: c_uint = 0x01;
+const CU_MEMORYTYPE_DEVICE: c_uint = 0x02;
+
+/// Mirrors the driver's CUDA_MEMCPY2D struct (field order + padding must match
+/// the C ABI exactly). Only the fields we use are set; the rest default to 0.
+pub const Memcpy2D = extern struct {
+    srcXInBytes: usize = 0,
+    srcY: usize = 0,
+    srcMemoryType: c_uint = 0,
+    srcHost: ?*const anyopaque = null,
+    srcDevice: CUdeviceptr = 0,
+    srcArray: ?*anyopaque = null,
+    srcPitch: usize = 0,
+    dstXInBytes: usize = 0,
+    dstY: usize = 0,
+    dstMemoryType: c_uint = 0,
+    dstHost: ?*anyopaque = null,
+    dstDevice: CUdeviceptr = 0,
+    dstArray: ?*anyopaque = null,
+    dstPitch: usize = 0,
+    WidthInBytes: usize = 0,
+    Height: usize = 0,
+};
+
+/// One tightly-packed device plane -> one strided host plane.
+pub const PlaneCopy = struct {
+    dst: [*]u8,
+    dst_pitch: usize,
+    device_ptr: usize,
+    width_bytes: usize,
+    height: usize,
+};
+
 const Fns = struct {
     init: *const fn (c_uint) callconv(.c) CUresult,
     deviceGetCount: *const fn (*c_int) callconv(.c) CUresult,
@@ -31,8 +65,11 @@ const Fns = struct {
     ctxPushCurrent: *const fn (CUcontext) callconv(.c) CUresult,
     ctxPopCurrent: *const fn (*CUcontext) callconv(.c) CUresult,
     memcpyDtoH: *const fn (*anyopaque, CUdeviceptr, usize) callconv(.c) CUresult,
+    memcpy2D: *const fn (*const Memcpy2D) callconv(.c) CUresult,
     memAllocHost: *const fn (*?*anyopaque, usize) callconv(.c) CUresult,
     memFreeHost: *const fn (*anyopaque) callconv(.c) CUresult,
+    hostRegister: *const fn (*anyopaque, usize, c_uint) callconv(.c) CUresult,
+    hostUnregister: *const fn (*anyopaque) callconv(.c) CUresult,
 };
 
 var fns: ?Fns = null;
@@ -67,8 +104,11 @@ fn load() void {
         .ctxPushCurrent = sym(@FieldType(Fns, "ctxPushCurrent"), h, "cuCtxPushCurrent_v2") orelse return,
         .ctxPopCurrent = sym(@FieldType(Fns, "ctxPopCurrent"), h, "cuCtxPopCurrent_v2") orelse return,
         .memcpyDtoH = sym(@FieldType(Fns, "memcpyDtoH"), h, "cuMemcpyDtoH_v2") orelse return,
+        .memcpy2D = sym(@FieldType(Fns, "memcpy2D"), h, "cuMemcpy2D_v2") orelse return,
         .memAllocHost = sym(@FieldType(Fns, "memAllocHost"), h, "cuMemAllocHost_v2") orelse return,
         .memFreeHost = sym(@FieldType(Fns, "memFreeHost"), h, "cuMemFreeHost") orelse return,
+        .hostRegister = sym(@FieldType(Fns, "hostRegister"), h, "cuMemHostRegister_v2") orelse return,
+        .hostUnregister = sym(@FieldType(Fns, "hostUnregister"), h, "cuMemHostUnregister") orelse return,
     };
 }
 
@@ -133,6 +173,54 @@ pub const Context = struct {
             _ = f.ctxPopCurrent(&popped);
         }
         if (f.memcpyDtoH(dst, device_ptr, size) != CU_SUCCESS) return error.CopyFailed;
+    }
+
+    /// Copy each tightly-packed device plane straight into its (strided) host
+    /// destination plane via cuMemcpy2D — skips the intermediate host staging
+    /// buffer and the CPU plane copy entirely. Context pushed once for all
+    /// planes. Callable from any thread.
+    pub fn copyPlanesDtoH(self: *const Context, planes: []const PlaneCopy) Error!void {
+        const f = get() orelse return error.CudaUnavailable;
+        if (f.ctxPushCurrent(self.handle) != CU_SUCCESS) return error.CopyFailed;
+        defer {
+            var popped: CUcontext = null;
+            _ = f.ctxPopCurrent(&popped);
+        }
+        for (planes) |p| {
+            const c = Memcpy2D{
+                .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+                .srcDevice = p.device_ptr,
+                .srcPitch = p.width_bytes,
+                .dstMemoryType = CU_MEMORYTYPE_HOST,
+                .dstHost = p.dst,
+                .dstPitch = p.dst_pitch,
+                .WidthInBytes = p.width_bytes,
+                .Height = p.height,
+            };
+            if (f.memcpy2D(&c) != CU_SUCCESS) return error.CopyFailed;
+        }
+    }
+
+    /// Page-lock a host region so DtoH into it runs at full (pinned) PCIe rate
+    /// instead of the ~half-rate pageable path. Best-effort; context pushed.
+    pub fn hostRegister(self: *const Context, ptr: *anyopaque, size: usize) Error!void {
+        const f = get() orelse return error.CudaUnavailable;
+        if (f.ctxPushCurrent(self.handle) != CU_SUCCESS) return error.CopyFailed;
+        defer {
+            var popped: CUcontext = null;
+            _ = f.ctxPopCurrent(&popped);
+        }
+        if (f.hostRegister(ptr, size, 0) != CU_SUCCESS) return error.CopyFailed;
+    }
+
+    pub fn hostUnregister(self: *const Context, ptr: *anyopaque) void {
+        const f = get() orelse return;
+        if (f.ctxPushCurrent(self.handle) != CU_SUCCESS) return;
+        defer {
+            var popped: CUcontext = null;
+            _ = f.ctxPopCurrent(&popped);
+        }
+        _ = f.hostUnregister(ptr);
     }
 
     /// Allocate pinned host memory (much faster device->host transfers).
