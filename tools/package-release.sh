@@ -47,10 +47,13 @@ package() { # <label> <deps-dir-name> <runtime-src...>
 }
 
 package vapoursynth-linux-x86_64 blackmagic_linux_deps "$RUNTIME/linux-x86_64/."
+package vapoursynth-linux-x86_64-v3 blackmagic_linux_deps "$RUNTIME/linux-x86_64/."
 package vapoursynth-windows-x86_64 blackmagic_win_deps "$RUNTIME/windows-x86_64/."
+package vapoursynth-windows-x86_64-v3 blackmagic_win_deps "$RUNTIME/windows-x86_64/."
 package vapoursynth-macos-x86_64 blackmagic_mac_deps "$RUNTIME/macos-universal/BlackmagicRawAPI.framework"
 package vapoursynth-macos-arm64 blackmagic_mac_deps "$RUNTIME/macos-universal/BlackmagicRawAPI.framework"
 package avisynth-windows-x86_64 blackmagic_win_deps "$RUNTIME/windows-x86_64/."
+package avisynth-windows-x86_64-v3 blackmagic_win_deps "$RUNTIME/windows-x86_64/."
 
 (cd "$OUT" && sha256sum brawsource-*.zip > SHA256SUMS.txt && cat SHA256SUMS.txt)
 echo "release zips in $OUT"
