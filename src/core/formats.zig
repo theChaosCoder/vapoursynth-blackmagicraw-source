@@ -60,12 +60,13 @@ pub fn resolveDepth(bitdepth: ?i64, fp: ?bool) DepthSelectError!?Depth {
 /// the output is always RGB. u8 has no planar variant, so it decodes as
 /// interleaved RGBA (the padding channel is dropped during the plane copy).
 /// The CPU pipeline rejects the f16 formats (E_INVALIDARG, GPU-only), so
-/// f16 output decodes as f32 and is converted during the plane copy.
-pub fn resourceFormat(depth: Depth) api.ResourceFormat {
+/// f16 output decodes there as f32 and is narrowed during the plane copy;
+/// GPU pipelines decode f16 natively (half the readback, no conversion).
+pub fn resourceFormat(depth: Depth, gpu_pipeline: bool) api.ResourceFormat {
     return switch (depth) {
         .u8_ => .rgba_u8,
         .u16_ => .rgb_u16_planar,
-        .f16 => .rgb_f32_planar,
+        .f16 => if (gpu_pipeline) .rgb_f16_planar else .rgb_f32_planar,
         .f32_ => .rgb_f32_planar,
     };
 }

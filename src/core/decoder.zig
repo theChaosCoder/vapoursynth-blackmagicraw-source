@@ -726,7 +726,7 @@ pub const Decoder = struct {
             // once the effective gamma is known
             .depth = opts.depth orelse .u16_,
             .scale = opts.scale,
-            .resource_format = formats.resourceFormat(opts.depth orelse .u16_),
+            .resource_format = formats.resourceFormat(opts.depth orelse .u16_, opts.pipeline != .cpu),
             .collect_all_meta = opts.collect_all_meta,
             .frame_overrides = opts.frame_overrides,
             .info = undefined,
@@ -963,7 +963,7 @@ pub const Decoder = struct {
         // automatic depth: 16-bit int, except scene-linear -> 32-bit float
         if (opts.depth == null) {
             self.depth = if (std.mem.eql(u8, eff_gamma, "Linear")) .f32_ else .u16_;
-            self.resource_format = formats.resourceFormat(self.depth);
+            self.resource_format = formats.resourceFormat(self.depth, self.pipeline != .cpu);
         }
 
         self.info = .{
