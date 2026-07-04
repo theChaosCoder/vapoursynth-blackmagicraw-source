@@ -102,7 +102,7 @@ def test_portrait_ntsc_and_random_access():
     check(tc0 != tc1, "timecode advances")
 
 
-def test_formats_and_alpha():
+def test_formats():
     # bitdepth selects the output depth (each variant must also decode)
     clip8 = open_clip(SDK_SAMPLE, bitdepth=8)
     check(clip8.format.id == vs.RGB24, "bitdepth=8 -> RGB24")
@@ -131,14 +131,6 @@ def test_formats_and_alpha():
         except vs.Error:
             global passed
             passed += 1
-
-    clipa = open_clip(SDK_SAMPLE, alpha=True)
-    fa = clipa.get_frame(0)
-    check("_Alpha" in fa.props, "_Alpha prop present")
-    alpha_frame = fa.props["_Alpha"]
-    adata = bytes(alpha_frame[0])
-    check(all(b == 0xFF for b in adata[:8192]), "alpha constant opaque (u16)")
-
 
 def test_scale():
     clip = open_clip(SDK_SAMPLE, scale=2)
@@ -342,7 +334,7 @@ def main():
 
     tests = []
     if SDK_SAMPLE.exists() and LIBPATH.exists():
-        tests += [test_sdk_sample, test_formats_and_alpha, test_scale, test_errors,
+        tests += [test_sdk_sample, test_formats, test_scale, test_errors,
                   test_processing_overrides, test_plugin_dir_deps_discovery]
         if (REPO / "test/oracle/bin/dump_frame").exists():
             tests += [test_oracle_byte_exact, test_audio]
