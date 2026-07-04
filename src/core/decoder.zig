@@ -5,8 +5,8 @@
 //! calls back on its own worker threads:
 //!   ReadComplete    -> harvest frame metadata, set format/scale, chain the
 //!                      decode+process job (same user data)
-//!   ProcessComplete -> validate the image, park it (retained image / GPU
-//!                      staging buffer) in the Request, signal the requester.
+//!   ProcessComplete -> validate the image, park it (retained image / Metal
+//!                      staging blit) in the Request, signal the requester.
 //! The REQUESTER thread then finishes the GPU readback and copies the
 //! pixels into the destination planes (finishRequest). The SDK dispatches
 //! completion callbacks serially, so any per-frame heavy lifting done inside
@@ -253,11 +253,10 @@ fn cudaDirectEligible(fmt: api.ResourceFormat, dst_depth: formats.Depth) bool {
 /// whichever fields are set were acquired by the callback and must be
 /// released by finishRequest, success or not.
 const Pending = struct {
-    image: ?*api.IBlackmagicRawProcessedImage = null, // retained (CPU + CUDA-direct: owns the source)
+    image: ?*api.IBlackmagicRawProcessedImage = null, // retained (CPU + CUDA: owns the source pixels)
     host_src: ?[*]const u8 = null,
     size: u32 = 0,
-    pinned: ?[]u8 = null, // CUDA: pooled pinned buffer holding the pixels
-    cuda_dev: ?usize = null, // CUDA-direct: device pointer of the (planar) decoded image
+    cuda_dev: ?usize = null, // CUDA: device pointer of the decoded image
     mtl_staging: ?metal.Staging = null,
     mtl_cmdbuf: ?*anyopaque = null, // in-flight blit; finishBlit before touching staging
 };
@@ -416,34 +415,20 @@ fn cbProcessComplete(_: *anyopaque, job: *api.IBlackmagicRawJob, hr: api.HRESULT
         return;
     }
 
-    // Don't copy here — the SDK dispatches these callbacks serially, so a
-    // per-frame plane copy would cap throughput. Park the pixels in the
-    // Request (keeping their owner alive) and let the requester thread do
-    // the readback wait + copy in finishRequest. CUDA is the exception: the
-    // DtoH copy stays here (transfers serialize on the context anyway), only
-    // the plane copy is deferred.
+    // Don't copy here — the SDK dispatches these callbacks serially, so any
+    // per-frame heavy lifting (plane copies, PCIe transfers) would cap
+    // throughput. Park the pixels in the Request (keeping their owner alive)
+    // and let the requester thread do the readback + copy in finishRequest.
+    // Metal only enqueues its blit here (cheap) and waits later.
     req.pending.size = size_bytes;
-    if (req.decoder.cuda_ctx) |*ctx| {
-        // CUDA-direct (planar formats only): the decoded device buffer is
-        // already planar, so skip the staging buffer — retain the image to
-        // keep the device memory alive and let finishRequest DtoH each plane
-        // straight into the VS frame. Cuts host memory traffic ~3x.
-        if (req.decoder.cuda_direct and cudaDirectEligible(got_fmt, req.decoder.depth)) {
-            api.addRef(image);
-            req.pending.image = image;
-            req.pending.cuda_dev = @intFromPtr(resource.?);
-        } else {
-            const buf = req.decoder.acquirePinned(size_bytes) catch {
-                req.oom = true;
-                return;
-            };
-            req.pending.pinned = buf;
-            ctx.readback(buf.ptr, @intFromPtr(resource.?), size_bytes) catch {
-                req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH)");
-                return;
-            };
-            req.pending.host_src = buf.ptr;
-        }
+    if (req.decoder.cuda_ctx != null) {
+        // Retain the image to keep the device buffer alive and park its
+        // pointer; finishRequest either DtoHs the planar planes straight
+        // into the frame (direct-eligible formats) or stages through a
+        // pooled pinned buffer — both off the serial callback thread.
+        api.addRef(image);
+        req.pending.image = image;
+        req.pending.cuda_dev = @intFromPtr(resource.?);
     } else if (req.decoder.metal_queue) |queue| {
         const stg = req.decoder.acquireMetalStaging(size_bytes) catch {
             req.oom = true;
@@ -1167,7 +1152,6 @@ pub const Decoder = struct {
     fn finishRequest(self: *Decoder, req: *Request) void {
         const p = &req.pending;
         defer {
-            if (p.pinned) |b| self.releasePinned(b);
             if (p.mtl_staging) |s| self.releaseMetalStaging(s);
             if (p.image) |img| api.release(img);
             p.* = .{};
@@ -1184,10 +1168,15 @@ pub const Decoder = struct {
         if (req.hr != api.S_OK or req.oom) return;
         const dest = req.dest orelse return;
 
-        // CUDA-direct: DtoH each already-planar device plane straight into the
-        // VS frame plane (no staging buffer, no CPU copy).
+        // CUDA: either DtoH each already-planar device plane straight into
+        // the frame plane (no staging buffer, no CPU copy), or stage through
+        // a pinned buffer for formats that need CPU conversion.
         if (p.cuda_dev) |dev| {
-            self.copyCudaPlanesDirect(req, dest, dev);
+            if (self.cuda_direct and cudaDirectEligible(req.resource_format, self.depth)) {
+                self.copyCudaPlanesDirect(req, dest, dev);
+            } else {
+                self.cudaStagingCopy(req, dest, dev);
+            }
             return;
         }
 
@@ -1240,15 +1229,18 @@ pub const Decoder = struct {
         } else ctx.copyPlanesDtoH(&planes);
         copy_result catch {
             _ = self.cuda_slow.fetchAdd(1, .monotonic);
-            self.cudaStagingFallback(req, dest, dev);
+            self.cudaStagingCopy(req, dest, dev);
             return;
         };
         _ = self.cuda_fast.fetchAdd(1, .monotonic);
     }
 
-    /// Reliable path: DtoH into a pooled pinned buffer, then CPU plane copy.
-    /// Used when the direct cuMemcpy2D into (partly) unpinned VS memory fails.
-    fn cudaStagingFallback(self: *Decoder, req: *Request, dest: *const formats.Dest, dev: usize) void {
+    /// Staging path: DtoH into a pooled pinned buffer (async on a pooled
+    /// stream when enabled, so it overlaps the SDK's decode work), then CPU
+    /// plane copy/de-interleave. Serves the formats the direct path can't
+    /// handle and any frame whose direct cuMemcpy2D failed (partly unpinned
+    /// VS memory).
+    fn cudaStagingCopy(self: *Decoder, req: *Request, dest: *const formats.Dest, dev: usize) void {
         const ctx = if (self.cuda_ctx) |*c| c else return;
         const size = req.pending.size;
         const buf = self.acquirePinned(size) catch {
@@ -1256,12 +1248,20 @@ pub const Decoder = struct {
             return;
         };
         defer self.releasePinned(buf);
-        ctx.readback(buf.ptr, dev, size) catch {
-            req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH fallback)");
+        const copy_result = if (self.cuda_stream) blk: {
+            const stream = self.acquireStream() orelse break :blk ctx.readback(buf.ptr, dev, size);
+            defer self.releaseStream(stream);
+            break :blk ctx.readbackAsync(buf.ptr, dev, size, stream);
+        } else ctx.readback(buf.ptr, dev, size);
+        copy_result catch {
+            req.fail(api.E_FAIL, "GPU readback (cuMemcpyDtoH)");
             return;
         };
-        formats.copyImage(req.resource_format, buf.ptr, size, dest, self.depth) catch {
-            req.fail(api.E_FAIL, "plane copy (fallback)");
+        formats.copyImage(req.resource_format, buf.ptr, size, dest, self.depth) catch |e| {
+            req.fail(api.E_FAIL, switch (e) {
+                error.SizeMismatch => "resource size mismatch (padded buffer?)",
+                error.UnsupportedFormat => "unsupported resource format",
+            });
         };
     }
 

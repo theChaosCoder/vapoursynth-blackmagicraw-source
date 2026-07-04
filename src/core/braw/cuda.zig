@@ -72,6 +72,7 @@ const Fns = struct {
     ctxPushCurrent: *const fn (CUcontext) callconv(.c) CUresult,
     ctxPopCurrent: *const fn (*CUcontext) callconv(.c) CUresult,
     memcpyDtoH: *const fn (*anyopaque, CUdeviceptr, usize) callconv(.c) CUresult,
+    memcpyDtoHAsync: *const fn (*anyopaque, CUdeviceptr, usize, Stream) callconv(.c) CUresult,
     memcpy2D: *const fn (*const Memcpy2D) callconv(.c) CUresult,
     memcpy2DAsync: *const fn (*const Memcpy2D, Stream) callconv(.c) CUresult,
     memAllocHost: *const fn (*?*anyopaque, usize) callconv(.c) CUresult,
@@ -115,6 +116,7 @@ fn load() void {
         .ctxPushCurrent = sym(@FieldType(Fns, "ctxPushCurrent"), h, "cuCtxPushCurrent_v2") orelse return,
         .ctxPopCurrent = sym(@FieldType(Fns, "ctxPopCurrent"), h, "cuCtxPopCurrent_v2") orelse return,
         .memcpyDtoH = sym(@FieldType(Fns, "memcpyDtoH"), h, "cuMemcpyDtoH_v2") orelse return,
+        .memcpyDtoHAsync = sym(@FieldType(Fns, "memcpyDtoHAsync"), h, "cuMemcpyDtoHAsync_v2") orelse return,
         .memcpy2D = sym(@FieldType(Fns, "memcpy2D"), h, "cuMemcpy2D_v2") orelse return,
         .memcpy2DAsync = sym(@FieldType(Fns, "memcpy2DAsync"), h, "cuMemcpy2DAsync_v2") orelse return,
         .memAllocHost = sym(@FieldType(Fns, "memAllocHost"), h, "cuMemAllocHost_v2") orelse return,
@@ -188,6 +190,22 @@ pub const Context = struct {
             _ = f.ctxPopCurrent(&popped);
         }
         if (f.memcpyDtoH(dst, device_ptr, size) != CU_SUCCESS) return error.CopyFailed;
+    }
+
+    /// Like readback, but issued on a (non-blocking) stream so the transfer
+    /// skips the legacy default stream's device-wide barrier and overlaps the
+    /// SDK's concurrent decode work. Waits for completion, so the stream is
+    /// idle again when this returns. The destination must be page-locked for
+    /// the copy to actually run asynchronously.
+    pub fn readbackAsync(self: *const Context, dst: [*]u8, device_ptr: usize, size: usize, stream: Stream) Error!void {
+        const f = get() orelse return error.CudaUnavailable;
+        if (f.ctxPushCurrent(self.handle) != CU_SUCCESS) return error.CopyFailed;
+        defer {
+            var popped: CUcontext = null;
+            _ = f.ctxPopCurrent(&popped);
+        }
+        if (f.memcpyDtoHAsync(dst, device_ptr, size, stream) != CU_SUCCESS) return error.CopyFailed;
+        if (f.streamSync(stream) != CU_SUCCESS) return error.CopyFailed;
     }
 
     /// Copy each tightly-packed device plane straight into its (strided) host
