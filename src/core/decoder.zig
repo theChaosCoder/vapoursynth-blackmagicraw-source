@@ -3,15 +3,16 @@
 //! Per opened clip: one codec, one clip, one callback object. Each frame
 //! request submits a read job carrying a `Request` as user data; the SDK
 //! calls back on its own worker threads:
-//!   ReadComplete    -> harvest frame metadata, set format/scale, chain the
-//!                      decode+process job (same user data)
+//!   ReadComplete    -> retain the frame (metadata is harvested later), set
+//!                      format/scale, chain the decode+process job (same
+//!                      user data)
 //!   ProcessComplete -> validate the image, park it (retained image / Metal
 //!                      staging blit) in the Request, signal the requester.
-//! The REQUESTER thread then finishes the GPU readback and copies the
-//! pixels into the destination planes (finishRequest). The SDK dispatches
-//! completion callbacks serially, so any per-frame heavy lifting done inside
-//! them caps throughput; deferring the copy lets it run in parallel across
-//! requesting threads.
+//! The REQUESTER thread then finishes the GPU readback, copies the pixels
+//! into the destination planes and harvests the frame metadata
+//! (finishRequest). The SDK dispatches completion callbacks serially, so any
+//! per-frame heavy lifting done inside them caps throughput; deferring the
+//! copy and the harvest lets them run in parallel across requesting threads.
 //! Callbacks touch only the Request and raw memory — never host APIs.
 //! Multiple requests may be in flight concurrently (the SDK decodes FIFO).
 
@@ -253,6 +254,7 @@ fn cudaDirectEligible(fmt: api.ResourceFormat, dst_depth: formats.Depth) bool {
 /// whichever fields are set were acquired by the callback and must be
 /// released by finishRequest, success or not.
 const Pending = struct {
+    frame: ?*api.IBlackmagicRawFrame = null, // retained; metadata harvested in finishRequest
     image: ?*api.IBlackmagicRawProcessedImage = null, // retained (CPU + CUDA: owns the source pixels)
     host_src: ?[*]const u8 = null,
     size: u32 = 0,
@@ -329,7 +331,12 @@ fn cbReadComplete(_: *anyopaque, job: *api.IBlackmagicRawJob, hr: api.HRESULT, f
     const frame = frame_opt orelse
         return failAndSignal(req, api.E_FAIL, "read frame (no frame object)");
 
-    harvestFrameMeta(req, frame);
+    // Defer the metadata harvest (iterator walk, string dups, prop
+    // allocations) to the requester thread: these callbacks dispatch
+    // serially, so per-frame work here caps decode throughput. The frame is
+    // retained and finishRequest harvests + releases it.
+    api.addRef(frame);
+    req.pending.frame = frame;
 
     // frame-accuracy invariant: the SDK must hand us exactly the frame we asked for
     var got_index: u64 = 0;
@@ -1152,6 +1159,7 @@ pub const Decoder = struct {
     fn finishRequest(self: *Decoder, req: *Request) void {
         const p = &req.pending;
         defer {
+            if (p.frame) |fr| api.release(fr);
             if (p.mtl_staging) |s| self.releaseMetalStaging(s);
             if (p.image) |img| api.release(img);
             p.* = .{};
@@ -1166,6 +1174,9 @@ pub const Decoder = struct {
             };
         }
         if (req.hr != api.S_OK or req.oom) return;
+        // Deferred metadata harvest (see cbReadComplete): walk the retained
+        // frame's metadata here, in parallel across requester threads.
+        if (p.frame) |fr| harvestFrameMeta(req, fr);
         const dest = req.dest orelse return;
 
         // CUDA: either DtoH each already-planar device plane straight into
