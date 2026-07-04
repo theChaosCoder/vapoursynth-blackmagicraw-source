@@ -238,12 +238,13 @@ fn envFlag(name: [:0]const u8, default: bool) bool {
 
 /// Formats the CUDA-direct DtoH-into-frame path can handle: three equal-size,
 /// tightly-packed device planes copied verbatim (no de-interleave, no bit-depth
-/// conversion). u16/f16 planar qualify; f32 planar may narrow to f16 and the
-/// interleaved RGBA formats need a CPU de-interleave, so they keep the staging
-/// path.
-fn cudaDirectEligible(fmt: api.ResourceFormat) bool {
+/// conversion). u16/f16 planar always qualify; f32 planar qualifies unless the
+/// destination is f16 (that narrowing needs a CPU pass). The interleaved RGBA
+/// formats need a CPU de-interleave, so they keep the staging path.
+fn cudaDirectEligible(fmt: api.ResourceFormat, dst_depth: formats.Depth) bool {
     return switch (fmt) {
         .rgb_u16_planar, .rgb_f16_planar => true,
+        .rgb_f32_planar => dst_depth == .f32_,
         else => false,
     };
 }
@@ -427,7 +428,7 @@ fn cbProcessComplete(_: *anyopaque, job: *api.IBlackmagicRawJob, hr: api.HRESULT
         // already planar, so skip the staging buffer — retain the image to
         // keep the device memory alive and let finishRequest DtoH each plane
         // straight into the VS frame. Cuts host memory traffic ~3x.
-        if (req.decoder.cuda_direct and cudaDirectEligible(got_fmt)) {
+        if (req.decoder.cuda_direct and cudaDirectEligible(got_fmt, req.decoder.depth)) {
             api.addRef(image);
             req.pending.image = image;
             req.pending.cuda_dev = @intFromPtr(resource.?);
