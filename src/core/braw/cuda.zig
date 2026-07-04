@@ -25,6 +25,13 @@ const CU_CTX_MAP_HOST: c_uint = 0x08;
 const CU_MEMORYTYPE_HOST: c_uint = 0x01;
 const CU_MEMORYTYPE_DEVICE: c_uint = 0x02;
 
+// Opt the stream out of the implicit device-wide sync with the legacy default
+// stream, so a DtoH copy on it overlaps the SDK's concurrent decode work.
+const CU_STREAM_NON_BLOCKING: c_uint = 0x01;
+
+/// A CUDA stream handle (opaque driver pointer). null == the default stream.
+pub const Stream = ?*anyopaque;
+
 /// Mirrors the driver's CUDA_MEMCPY2D struct (field order + padding must match
 /// the C ABI exactly). Only the fields we use are set; the rest default to 0.
 pub const Memcpy2D = extern struct {
@@ -66,10 +73,14 @@ const Fns = struct {
     ctxPopCurrent: *const fn (*CUcontext) callconv(.c) CUresult,
     memcpyDtoH: *const fn (*anyopaque, CUdeviceptr, usize) callconv(.c) CUresult,
     memcpy2D: *const fn (*const Memcpy2D) callconv(.c) CUresult,
+    memcpy2DAsync: *const fn (*const Memcpy2D, Stream) callconv(.c) CUresult,
     memAllocHost: *const fn (*?*anyopaque, usize) callconv(.c) CUresult,
     memFreeHost: *const fn (*anyopaque) callconv(.c) CUresult,
     hostRegister: *const fn (*anyopaque, usize, c_uint) callconv(.c) CUresult,
     hostUnregister: *const fn (*anyopaque) callconv(.c) CUresult,
+    streamCreate: *const fn (*Stream, c_uint) callconv(.c) CUresult,
+    streamDestroy: *const fn (Stream) callconv(.c) CUresult,
+    streamSync: *const fn (Stream) callconv(.c) CUresult,
 };
 
 var fns: ?Fns = null;
@@ -105,10 +116,14 @@ fn load() void {
         .ctxPopCurrent = sym(@FieldType(Fns, "ctxPopCurrent"), h, "cuCtxPopCurrent_v2") orelse return,
         .memcpyDtoH = sym(@FieldType(Fns, "memcpyDtoH"), h, "cuMemcpyDtoH_v2") orelse return,
         .memcpy2D = sym(@FieldType(Fns, "memcpy2D"), h, "cuMemcpy2D_v2") orelse return,
+        .memcpy2DAsync = sym(@FieldType(Fns, "memcpy2DAsync"), h, "cuMemcpy2DAsync_v2") orelse return,
         .memAllocHost = sym(@FieldType(Fns, "memAllocHost"), h, "cuMemAllocHost_v2") orelse return,
         .memFreeHost = sym(@FieldType(Fns, "memFreeHost"), h, "cuMemFreeHost") orelse return,
         .hostRegister = sym(@FieldType(Fns, "hostRegister"), h, "cuMemHostRegister_v2") orelse return,
         .hostUnregister = sym(@FieldType(Fns, "hostUnregister"), h, "cuMemHostUnregister") orelse return,
+        .streamCreate = sym(@FieldType(Fns, "streamCreate"), h, "cuStreamCreate") orelse return,
+        .streamDestroy = sym(@FieldType(Fns, "streamDestroy"), h, "cuStreamDestroy_v2") orelse return,
+        .streamSync = sym(@FieldType(Fns, "streamSync"), h, "cuStreamSynchronize") orelse return,
     };
 }
 
@@ -199,6 +214,63 @@ pub const Context = struct {
             };
             if (f.memcpy2D(&c) != CU_SUCCESS) return error.CopyFailed;
         }
+    }
+
+    /// Create a non-blocking stream. A DtoH copy issued on it does not insert
+    /// the device-wide barrier that the legacy default stream would, so it
+    /// overlaps the SDK's decode of the next frame. Context pushed for the call.
+    pub fn createStream(self: *const Context) Error!Stream {
+        const f = get() orelse return error.CudaUnavailable;
+        if (f.ctxPushCurrent(self.handle) != CU_SUCCESS) return error.ContextFailed;
+        defer {
+            var popped: CUcontext = null;
+            _ = f.ctxPopCurrent(&popped);
+        }
+        var s: Stream = null;
+        if (f.streamCreate(&s, CU_STREAM_NON_BLOCKING) != CU_SUCCESS) return error.ContextFailed;
+        return s;
+    }
+
+    pub fn destroyStream(self: *const Context, s: Stream) void {
+        const f = get() orelse return;
+        if (f.ctxPushCurrent(self.handle) != CU_SUCCESS) return;
+        defer {
+            var popped: CUcontext = null;
+            _ = f.ctxPopCurrent(&popped);
+        }
+        _ = f.streamDestroy(s);
+    }
+
+    /// Like copyPlanesDtoH, but issues each plane copy asynchronously on a
+    /// non-blocking stream and waits once at the end. With page-locked
+    /// destinations the transfers run on the copy engine concurrently with the
+    /// SDK's decode work instead of serializing on the default stream. On any
+    /// failure the stream is drained before returning so no copy is still in
+    /// flight into the destination when the caller runs its fallback.
+    pub fn copyPlanesDtoHAsync(self: *const Context, planes: []const PlaneCopy, stream: Stream) Error!void {
+        const f = get() orelse return error.CudaUnavailable;
+        if (f.ctxPushCurrent(self.handle) != CU_SUCCESS) return error.CopyFailed;
+        defer {
+            var popped: CUcontext = null;
+            _ = f.ctxPopCurrent(&popped);
+        }
+        for (planes) |p| {
+            const c = Memcpy2D{
+                .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+                .srcDevice = p.device_ptr,
+                .srcPitch = p.width_bytes,
+                .dstMemoryType = CU_MEMORYTYPE_HOST,
+                .dstHost = p.dst,
+                .dstPitch = p.dst_pitch,
+                .WidthInBytes = p.width_bytes,
+                .Height = p.height,
+            };
+            if (f.memcpy2DAsync(&c, stream) != CU_SUCCESS) {
+                _ = f.streamSync(stream); // drain queued copies before fallback
+                return error.CopyFailed;
+            }
+        }
+        if (f.streamSync(stream) != CU_SUCCESS) return error.CopyFailed;
     }
 
     /// Page-lock a host region so DtoH into it runs at full (pinned) PCIe rate

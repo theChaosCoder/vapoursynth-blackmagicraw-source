@@ -677,6 +677,10 @@ pub const Decoder = struct {
     // reuses frame buffers, so registration amortises). Toggled by env for A/B.
     cuda_direct: bool = true,
     cuda_pin: bool = true,
+    // Async-stream spike: issue the direct DtoH on a pooled non-blocking stream
+    // (instead of the default stream) so it overlaps the SDK's next decode.
+    cuda_stream: bool = true,
+    stream_pool: std.ArrayList(cuda.Stream) = .empty,
     reg_pool: std.ArrayList(usize) = .empty,
     cuda_fast: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     cuda_slow: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -731,6 +735,7 @@ pub const Decoder = struct {
             .pipeline = opts.pipeline,
             .cuda_direct = envFlag("BRAW_CUDA_DIRECT", true),
             .cuda_pin = envFlag("BRAW_CUDA_PIN", true),
+            .cuda_stream = envFlag("BRAW_CUDA_STREAM", true),
             // provisional when depth is auto; finalized in collectClipInfo
             // once the effective gamma is known
             .depth = opts.depth orelse .u16_,
@@ -1059,6 +1064,26 @@ pub const Decoder = struct {
         };
     }
 
+    /// Borrow a non-blocking stream from the pool (creating one on demand).
+    /// Returns null if CUDA is absent or stream creation fails, in which case
+    /// the caller uses the default-stream path. Grows to the requester-thread
+    /// count under fmParallel, one live stream per concurrent DtoH.
+    fn acquireStream(self: *Decoder) ?cuda.Stream {
+        const ctx = if (self.cuda_ctx) |*c| c else return null;
+        self.pinned_mutex.lock();
+        defer self.pinned_mutex.unlock();
+        if (self.stream_pool.pop()) |s| return s;
+        return ctx.createStream() catch return null;
+    }
+
+    fn releaseStream(self: *Decoder, s: cuda.Stream) void {
+        self.pinned_mutex.lock();
+        defer self.pinned_mutex.unlock();
+        self.stream_pool.append(self.gpa, s) catch {
+            if (self.cuda_ctx) |*ctx| ctx.destroyStream(s);
+        };
+    }
+
     fn acquireMetalStaging(self: *Decoder, size: u32) !metal.Staging {
         self.pinned_mutex.lock();
         defer self.pinned_mutex.unlock();
@@ -1091,6 +1116,8 @@ pub const Decoder = struct {
             self.pinned_pool.deinit(gpa);
             for (self.reg_pool.items) |addr| ctx.hostUnregister(@ptrFromInt(addr));
             self.reg_pool.deinit(gpa);
+            for (self.stream_pool.items) |s| ctx.destroyStream(s);
+            self.stream_pool.deinit(gpa);
             const fast = self.cuda_fast.load(.monotonic);
             const slow = self.cuda_slow.load(.monotonic);
             if (self.cuda_direct and fast + slow > 0 and envFlag("BRAW_CUDA_STATS", false))
@@ -1200,7 +1227,17 @@ pub const Decoder = struct {
         // VS planes are separate allocations; page-sharing between two of them
         // can leave one partly page-locked, which cuMemcpy2D rejects. On any
         // failure fall back to the reliable pinned-staging path for this frame.
-        ctx.copyPlanesDtoH(&planes) catch {
+        //
+        // Default stream serializes the transfer against the SDK's decode; a
+        // pooled non-blocking stream lets them overlap. copyPlanesDtoHAsync
+        // waits internally, so the stream carries no in-flight work once it
+        // returns and is safe to recycle.
+        const copy_result = if (self.cuda_stream) blk: {
+            const stream = self.acquireStream() orelse break :blk ctx.copyPlanesDtoH(&planes);
+            defer self.releaseStream(stream);
+            break :blk ctx.copyPlanesDtoHAsync(&planes, stream);
+        } else ctx.copyPlanesDtoH(&planes);
+        copy_result catch {
             _ = self.cuda_slow.fetchAdd(1, .monotonic);
             self.cudaStagingFallback(req, dest, dev);
             return;
