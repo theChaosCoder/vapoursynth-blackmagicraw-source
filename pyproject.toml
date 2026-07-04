@@ -1,0 +1,73 @@
+[build-system]
+# We don't go through setuptools / hatchling at build time — the wheels
+# are produced by `scripts/build_pypi_wheels.py`, which takes the
+# pre-built artefacts from `zig build release` plus the Blackmagic RAW
+# runtime from third_party/ and assembles a platform-tagged wheel per
+# (OS, arch). This file is therefore a pure project-metadata document;
+# running `pip install .` from a source checkout is *not* supported.
+# End users either:
+#   * `pip install vapoursynth-brawsource` (platform-matched wheel from
+#     PyPI, Blackmagic RAW runtime included), or
+#   * download the `.zip` from the GitHub release and drop plugin + deps
+#     folder into their VapourSynth plugin directory by hand. The GitHub
+#     zips additionally come in `-v3` variants (AVX2/F16C) that PyPI's
+#     platform tags cannot express.
+#
+# Publishing from source:
+#   tools/extract-sdk.sh          (once; unpacks the BRAW runtime)
+#   zig build release
+#   python scripts/build_pypi_wheels.py
+#   uv build --sdist
+#   uvx twine upload dist/*
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vapoursynth-brawsource"
+version = "0.3.1"
+description = "Blackmagic RAW (.braw) source plugin for VapourSynth — batteries included (bundles the Blackmagic RAW runtime)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "theChaosCoder" },
+]
+keywords = ["video", "vapoursynth", "braw", "blackmagic", "raw", "source", "decoder"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Plugins",
+    "Intended Audience :: End Users/Desktop",
+    "Natural Language :: English",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Other",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Video :: Conversion",
+]
+dependencies = ["VapourSynth>=66"]
+
+[project.urls]
+Homepage   = "https://github.com/theChaosCoder/vapoursynth-blackmagicraw-source"
+Repository = "https://github.com/theChaosCoder/vapoursynth-blackmagicraw-source"
+Issues     = "https://github.com/theChaosCoder/vapoursynth-blackmagicraw-source/issues"
+Releases   = "https://github.com/theChaosCoder/vapoursynth-blackmagicraw-source/releases"
+
+# Hatchling source-distribution layout. The sdist contains the Zig
+# source so curious users can rebuild from scratch; the wheels (built
+# separately by scripts/build_pypi_wheels.py) include the pre-compiled
+# plugin plus the redistributable Blackmagic RAW runtime for one
+# platform. The BRAW SDK headers are vendored in the repo and included.
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/**",
+    "vendor/**",
+    "tools/**",
+    "scripts/**",
+    "build.zig",
+    "build.zig.zon",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]

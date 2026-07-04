@@ -472,7 +472,7 @@ export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI
         plugin_id,
         "braw",
         "Blackmagic RAW source",
-        .{ .major = 0, .minor = 3, .patch = 0 },
+        .{ .major = 0, .minor = 3, .patch = 1 },
         plugin,
         vspapi,
     );

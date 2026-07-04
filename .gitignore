@@ -11,3 +11,4 @@ __pycache__/
 test/oracle/bin/
 zig-pkg/
 .DS_Store
+dist/

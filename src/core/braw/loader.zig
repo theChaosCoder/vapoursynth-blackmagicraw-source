@@ -30,6 +30,14 @@ else if (is_macos)
 else
     "blackmagic_linux_deps";
 
+/// pip-wheel deployment location: the plugin lands in
+/// site-packages/vapoursynth/plugins/, and the runtime lives two levels up
+/// in site-packages/vapoursynth_brawsource.libs/ (the auditwheel
+/// convention, e.g. BestSource). It cannot live inside plugins/: the
+/// VapourSynth autoloader recursively tries every *.so there and warns
+/// about each runtime library.
+pub const pip_libs_subdir = ".." ++ std.fs.path.sep_str ++ ".." ++ std.fs.path.sep_str ++ "vapoursynth_brawsource.libs";
+
 /// Default install locations of the Blackmagic RAW runtime per OS
 /// (Blackmagic RAW desktop software and DaVinci Resolve).
 pub const default_dirs: []const []const u8 = if (is_windows) &.{
@@ -149,6 +157,7 @@ pub fn candidatePaths(
 
     if (plugin_dir) |pd| {
         try list.append(gpa, try std.fs.path.joinZ(gpa, &.{ pd, deps_subdir, lib_file_name }));
+        try list.append(gpa, try std.fs.path.joinZ(gpa, &.{ pd, pip_libs_subdir, lib_file_name }));
         try list.append(gpa, try std.fs.path.joinZ(gpa, &.{ pd, "BlackmagicRawAPI", lib_file_name }));
         try list.append(gpa, try std.fs.path.joinZ(gpa, &.{ pd, lib_file_name }));
     }
@@ -285,12 +294,13 @@ test "candidate paths: explicit file wins" {
     try std.testing.expectEqualStrings("/nonexistent/libFoo.so", paths[0]);
 }
 
-test "candidate paths: per-os deps dir first, then fallbacks" {
+test "candidate paths: per-os deps dir first, then pip libs, then fallbacks" {
     const gpa = std.testing.allocator;
     const paths = try candidatePaths(gpa, null, "/plug");
     defer freeCandidates(gpa, paths);
-    try std.testing.expect(paths.len >= 3 + default_dirs.len);
+    try std.testing.expect(paths.len >= 4 + default_dirs.len);
     try std.testing.expect(std.mem.indexOf(u8, paths[0], deps_subdir) != null);
     try std.testing.expect(std.mem.startsWith(u8, paths[0], "/plug"));
-    try std.testing.expect(std.mem.indexOf(u8, paths[1], "BlackmagicRawAPI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paths[1], "vapoursynth_brawsource.libs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paths[2], "BlackmagicRawAPI") != null);
 }

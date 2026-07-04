@@ -9,6 +9,18 @@ Frame-exact random access, audio, frame properties from clip/frame metadata.
 
 ![sample.braw decoded in VS View, frame properties from the clip metadata](doc/brawsource.jpg)
 
+## Install
+
+VapourSynth users can install straight from PyPI — runtime included,
+no DaVinci Resolve needed:
+
+```sh
+pip install vapoursynth-brawsource
+```
+
+The wheels are baseline x86-64; for the faster `-v3` builds (AVX2/F16C)
+or the AviSynth+ plugin, grab a release zip below.
+
 ## Runtime
 
 The plugin loads the Blackmagic RAW runtime at run time. **The release zips
