@@ -20,6 +20,10 @@ convention works with your own copy of the runtime; alternatively an
 installed Blackmagic RAW / DaVinci Resolve is found automatically, or use
 the `libpath` parameter / `BRAW_LIBRARY` env var.
 
+x86_64 builds come in two flavors: the plain one runs on any CPU, the
+**`-v3`** one (x86-64-v3: AVX2/F16C, Intel Haswell 2013+ / AMD Excavator+)
+has noticeably faster pixel-copy loops — prefer it on any recent machine.
+
 ## Usage
 
 ```python

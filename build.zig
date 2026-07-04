@@ -21,10 +21,9 @@ fn addVsLib(
 fn addAvsLib(
     b: *std.Build,
     core_mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget, // always Windows x64, CPU model may vary
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Step.Compile {
-    // AviSynth+ target is fixed: Windows x64
-    const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu });
     const mod = b.createModule(.{
         .root_source_file = b.path("src/avisynth/plugin.zig"),
         .target = target,
@@ -98,7 +97,8 @@ pub fn build(b: *std.Build) void {
     const build_avs = b.option(bool, "avs", "Build the AviSynth plugin (win x64)") orelse true;
     var avs_lib_step: ?*std.Build.Step.Compile = null;
     if (build_avs) {
-        const avs_lib = addAvsLib(b, core_mod, optimize);
+        const avs_target = b.resolveTargetQuery(avs_target_query);
+        const avs_lib = addAvsLib(b, core_mod, avs_target, optimize);
         b.getInstallStep().dependOn(&installTo(b, avs_lib, "avisynth").step);
         avs_lib_step = avs_lib;
     }
@@ -111,11 +111,18 @@ pub fn build(b: *std.Build) void {
     if (avs_lib_step) |l| check.dependOn(&l.step);
 
     // --- release matrix: all shipped targets, ReleaseFast ---
+    // x86_64 ships twice: baseline (SSE2, runs on anything) and -v3 (AVX2 +
+    // F16C, CPUs from ~2013) — the pixel copy loops vectorize far better
+    // under v3 (pshufb de-interleave, hardware f32->f16 instead of a libcall
+    // per sample). Intel macOS gets ivybridge (AVX + F16C, no AVX2): the Mac
+    // Pro 2013 is the oldest machine that runs a macOS the SDK supports.
     const release_targets = [_]struct { q: std.Target.Query, label: []const u8 }{
         // glibc pinned old for broad distro compatibility (dlopen only)
         .{ .q = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 17, .patch = 0 } }, .label = "release/vapoursynth-linux-x86_64" },
+        .{ .q = .{ .cpu_arch = .x86_64, .cpu_model = v3_model, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 17, .patch = 0 } }, .label = "release/vapoursynth-linux-x86_64-v3" },
         .{ .q = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }, .label = "release/vapoursynth-windows-x86_64" },
-        .{ .q = .{ .cpu_arch = .x86_64, .os_tag = .macos }, .label = "release/vapoursynth-macos-x86_64" },
+        .{ .q = .{ .cpu_arch = .x86_64, .cpu_model = v3_model, .os_tag = .windows, .abi = .gnu }, .label = "release/vapoursynth-windows-x86_64-v3" },
+        .{ .q = .{ .cpu_arch = .x86_64, .cpu_model = .{ .explicit = &std.Target.x86.cpu.ivybridge }, .os_tag = .macos }, .label = "release/vapoursynth-macos-x86_64" },
         .{ .q = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .label = "release/vapoursynth-macos-arm64" },
     };
     const release = b.step("release", "Build all release artifacts (ReleaseFast)");
@@ -123,6 +130,15 @@ pub fn build(b: *std.Build) void {
         const rlib = addVsLib(b, core_mod, b.resolveTargetQuery(rt.q), .ReleaseFast);
         release.dependOn(&installTo(b, rlib, rt.label).step);
     }
-    const avs_release = addAvsLib(b, core_mod, .ReleaseFast);
+    const avs_release = addAvsLib(b, core_mod, b.resolveTargetQuery(avs_target_query), .ReleaseFast);
     release.dependOn(&installTo(b, avs_release, "release/avisynth-windows-x86_64").step);
+    var avs_v3_query = avs_target_query;
+    avs_v3_query.cpu_model = v3_model;
+    const avs_release_v3 = addAvsLib(b, core_mod, b.resolveTargetQuery(avs_v3_query), .ReleaseFast);
+    release.dependOn(&installTo(b, avs_release_v3, "release/avisynth-windows-x86_64-v3").step);
 }
+
+const v3_model: std.Target.Query.CpuModel = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
+
+// AviSynth+ runs on Windows x64 only; the CPU model is the one degree of freedom.
+const avs_target_query: std.Target.Query = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu };
