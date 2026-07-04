@@ -675,6 +675,7 @@ pub const Decoder = struct {
     cuda_stream: bool = true,
     stream_pool: std.ArrayList(cuda.Stream) = .empty,
     reg_pool: std.ArrayList(usize) = .empty,
+    reg_failed: std.ArrayList(usize) = .empty, // addresses cuMemHostRegister rejected
     cuda_fast: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     cuda_slow: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
@@ -1109,6 +1110,7 @@ pub const Decoder = struct {
             self.pinned_pool.deinit(gpa);
             for (self.reg_pool.items) |addr| ctx.hostUnregister(@ptrFromInt(addr));
             self.reg_pool.deinit(gpa);
+            self.reg_failed.deinit(gpa);
             for (self.stream_pool.items) |s| ctx.destroyStream(s);
             self.stream_pool.deinit(gpa);
             const fast = self.cuda_fast.load(.monotonic);
@@ -1285,7 +1287,15 @@ pub const Decoder = struct {
         self.pinned_mutex.lock();
         defer self.pinned_mutex.unlock();
         for (self.reg_pool.items) |a| if (a == addr) return;
-        ctx.hostRegister(ptr, size) catch return; // fall back to pageable
+        for (self.reg_failed.items) |a| if (a == addr) return;
+        ctx.hostRegister(ptr, size) catch {
+            // Remember the rejection (page-sharing with an already-registered
+            // region): retrying every frame costs a page walk each time and
+            // the DtoH just runs pageable for this buffer. Same staleness
+            // caveat as reg_pool if the host recycles the address.
+            self.reg_failed.append(self.gpa, addr) catch {};
+            return;
+        };
         self.reg_pool.append(self.gpa, addr) catch ctx.hostUnregister(ptr);
     }
 

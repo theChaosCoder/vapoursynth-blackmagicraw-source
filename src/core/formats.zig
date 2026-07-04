@@ -140,6 +140,12 @@ fn copyPlanar(comptime Src: type, comptime Dst: type, src_raw: [*]const u8, dst:
         const dp = dst.planes[plane] orelse continue;
         const stride = dst.strides[plane];
         const base = src + plane * w * h;
+        if (Src == Dst and stride == w * @sizeOf(Src)) {
+            // destination rows are tightly packed: one copy per plane
+            const plane_bytes = w * @sizeOf(Src) * h;
+            @memcpy(dp[0..plane_bytes], @as([*]const u8, @ptrCast(base))[0..plane_bytes]);
+            continue;
+        }
         var y: usize = 0;
         while (y < h) : (y += 1) {
             const row = base + y * w;
