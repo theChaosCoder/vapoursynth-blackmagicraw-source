@@ -39,20 +39,21 @@ pipelined, 6 jobs in flight, reused staging buffer):
 | 6K (6048×4032, u16) | 32 fps | 86 fps (**2.7×**) | 155 fps (4.8×) |
 
 **In the plugin, via VapourSynth** (`test/bench/bench_vs.py`, best thread
-count):
+count, v0.3.1 release build):
 
 | clip / resolution | CPU fps | Metal fps | speedup |
 |---|---|---|---|
-| 4608×2592 (4.6K, u16) | 81 | 185 | **2.28×** |
-| 2304×1296 (scale=2) | 271 | 441 | **1.63×** |
-| 6048×4032 (6K, u16) | 32 | 49 | **1.55×** |
+| 4608×2592 (4.6K, u16) | 73 | 196 | **2.70×** |
+| 4608×2592 (4.6K, f16) | 72 | 170 | **2.37×** |
+| 2304×1296 (scale=2) | 269 | 446 | **1.66×** |
+| 6048×4032 (6K, u16) | 33 | 59 | **1.82×** |
 
-At 4.6K both pipelines run at ~90 % of their raw standalone decode rate —
-the plugin adds almost no overhead anymore (see "How the plugin keeps up"
-below). And the CPU is left nearly idle with Metal: at 4.6K the CPU pipeline
-burns ~120 ms of CPU time per frame (~5 cores busy), the Metal pipeline
-~21 ms — **~6× less CPU work at 2× the throughput**, so the cores stay free
-for downstream filters.
+At 4.6K both pipelines run near their raw standalone decode rate (Metal at
+97 %, CPU at ~91 %) — the plugin adds almost no overhead anymore (see "How
+the plugin keeps up" below). And the CPU is left nearly idle with Metal: at
+4.6K the CPU pipeline burns ~118 ms of CPU time per frame (~5 cores busy),
+the Metal pipeline ~30 ms — **~4× less CPU work at 2.7× the throughput**,
+so the cores stay free for downstream filters.
 
 Two properties of Apple Silicon make Metal a clear win where CUDA isn't:
 the readback blit stays on-chip (unified memory, no PCIe round-trip), and
@@ -123,13 +124,13 @@ closed the gap:
    in parallel across VS worker threads.
 
 Remaining ceilings: at 4.6K both pipelines sit near their raw decode rates.
-At 6K the Metal path reaches ~57 % of raw (49 vs 86 fps) — each frame moves
+At 6K the Metal path reaches ~69 % of raw (59 vs 86 fps) — each frame moves
 146 MB through blit, plane copy and VS frame allocation, so memory traffic
 and allocation dominate; the CPU pipeline is already at its raw limit.
 
 ## Takeaway
 
-- **macOS / Apple Silicon**: use `pipeline="metal"` — 1.5–2.3× the source
+- **macOS / Apple Silicon**: use `pipeline="metal"` — 1.7–2.7× the source
   throughput at every resolution tested *and* an almost idle CPU. The CPU
   pipeline only makes sense if the GPU is busy elsewhere.
 - **Linux/Windows + NVIDIA**: `pipeline="cuda"` is worth it when decoding
