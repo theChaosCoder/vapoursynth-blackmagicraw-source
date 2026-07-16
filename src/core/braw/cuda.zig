@@ -161,8 +161,12 @@ pub const Context = struct {
         var self: Context = .{ .handle = null };
         _ = f.deviceGetName(&self.device_name, self.device_name.len - 1, dev);
 
-        if (f.ctxCreate(&self.handle, CU_CTX_MAP_HOST | CU_CTX_SCHED_BLOCKING_SYNC, dev) != CU_SUCCESS)
+        const crc = f.ctxCreate(&self.handle, CU_CTX_MAP_HOST | CU_CTX_SCHED_BLOCKING_SYNC, dev);
+        if (crc != CU_SUCCESS) {
+            if (std.c.getenv("BRAW_CUDA_DEBUG") != null)
+                std.debug.print("[braw-cuda] cuCtxCreate rc={d}\n", .{crc});
             return error.ContextFailed;
+        }
         // don't leave the context current on the caller thread
         var popped: CUcontext = null;
         _ = f.ctxPopCurrent(&popped);
@@ -310,7 +314,11 @@ pub const Context = struct {
             var popped: CUcontext = null;
             _ = f.ctxPopCurrent(&popped);
         }
-        _ = f.hostUnregister(ptr);
+        const rc = f.hostUnregister(ptr);
+        if (rc != CU_SUCCESS) {
+            if (std.c.getenv("BRAW_CUDA_DEBUG") != null)
+                std.debug.print("[braw-cuda] cuMemHostUnregister({*}) rc={d}\n", .{ ptr, rc });
+        }
     }
 
     /// Allocate pinned host memory (much faster device->host transfers).

@@ -156,7 +156,10 @@ pub fn available() bool {
 /// HostAccessForbidden = CL_INVALID_OPERATION on a read/map: the buffer was
 /// created host-inaccessible. Deterministic per buffer, so callers disable
 /// the failing path instead of retrying every frame.
-pub const Error = error{ OpenClUnavailable, ContextFailed, CopyFailed, HostAccessForbidden, OutOfMemory };
+/// QueueBroken = a drain (clFinish) or unmap failed, so commands may still
+/// be in flight — the queue and any staging buffer bound up in the failure
+/// must be destroyed, not returned to their pools.
+pub const Error = error{ OpenClUnavailable, ContextFailed, CopyFailed, HostAccessForbidden, QueueBroken, OutOfMemory };
 
 /// Print a failed CL call when BRAW_OCL_DEBUG is set (diagnosing driver
 /// quirks in the field without a debug build). Same off-values as the
@@ -273,13 +276,11 @@ pub const Context = struct {
             );
             if (rc != CL_SUCCESS) {
                 debugErr("clEnqueueReadBufferRect", rc);
-                _ = f.finish(queue); // drain queued copies before fallback
+                if (f.finish(queue) != CL_SUCCESS) return error.QueueBroken; // drain before fallback
                 return copyError(rc);
             }
         }
-        // A failing clFinish means the queue/context died (device lost) —
-        // same residual as the CUDA path's streamSync; nothing to drain.
-        if (f.finish(queue) != CL_SUCCESS) return error.CopyFailed;
+        if (f.finish(queue) != CL_SUCCESS) return error.QueueBroken;
     }
 
     /// Allocate a pinned (CL_MEM_ALLOC_HOST_PTR) staging buffer. Mapped per
@@ -315,7 +316,7 @@ pub const Context = struct {
             debugErr("clEnqueueMapBuffer", err);
             // the copy IS in flight: drain before the caller releases the
             // source image and pools the staging buffer/queue
-            _ = f.finish(queue);
+            if (f.finish(queue) != CL_SUCCESS) return error.QueueBroken;
             return copyError(err);
         };
         return @ptrCast(ptr);
@@ -323,11 +324,16 @@ pub const Context = struct {
 
     /// Unmap after the CPU copy and drain the queue, so the staging buffer
     /// carries no in-flight unmap when it returns to the pool (the next
-    /// frame may borrow a different queue).
-    pub fn unmapStaging(_: *const Context, queue: Queue, stg: Staging, ptr: [*]const u8) void {
-        const f = get() orelse return;
-        _ = f.enqueueUnmapMemObject(queue, stg.mem, @constCast(ptr), 0, null, null);
-        _ = f.finish(queue);
+    /// frame may borrow a different queue). QueueBroken means the unmap may
+    /// still be pending — destroy the queue and staging instead of pooling.
+    pub fn unmapStaging(_: *const Context, queue: Queue, stg: Staging, ptr: [*]const u8) Error!void {
+        const f = get() orelse return error.OpenClUnavailable;
+        const rc = f.enqueueUnmapMemObject(queue, stg.mem, @constCast(ptr), 0, null, null);
+        if (rc != CL_SUCCESS) {
+            debugErr("clEnqueueUnmapMemObject", rc);
+            return error.QueueBroken;
+        }
+        if (f.finish(queue) != CL_SUCCESS) return error.QueueBroken;
     }
 };
 

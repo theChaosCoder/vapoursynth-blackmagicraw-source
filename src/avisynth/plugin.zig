@@ -51,25 +51,19 @@ const Api = struct {
     save_string: *const fn (?*Env, [*c]const u8, c_int) callconv(cc) [*c]u8,
 };
 var api: Api = undefined;
+var api_ok = false;
 
-fn loadApi() void {
+/// Bind every needed loader symbol. The V8 frame-property entry points are
+/// loaded OPTIONALLY by avisynth_c.h (AVSC_LOAD_FUNC_OPT) and are null on
+/// pre-3.6 hosts — unwrapping them blindly would crash the host at plugin
+/// load, so a single missing symbol aborts the bind instead.
+fn loadApi() bool {
     const L = g_lib.?;
-    api = .{
-        .new_video_frame_a = @ptrCast(L.avs_new_video_frame_a.?),
-        .release_video_frame = @ptrCast(L.avs_release_video_frame.?),
-        .get_write_ptr_p = @ptrCast(L.avs_get_write_ptr_p.?),
-        .get_pitch_p = @ptrCast(L.avs_get_pitch_p.?),
-        .get_frame_props_rw = @ptrCast(L.avs_get_frame_props_rw.?),
-        .prop_set_int = @ptrCast(L.avs_prop_set_int.?),
-        .prop_set_float = @ptrCast(L.avs_prop_set_float.?),
-        .prop_set_data = @ptrCast(L.avs_prop_set_data.?),
-        .prop_set_int_array = @ptrCast(L.avs_prop_set_int_array.?),
-        .prop_set_float_array = @ptrCast(L.avs_prop_set_float_array.?),
-        .release_clip = @ptrCast(L.avs_release_clip.?),
-        .set_to_clip = @ptrCast(L.avs_set_to_clip.?),
-        .add_function = @ptrCast(L.avs_add_function.?),
-        .save_string = @ptrCast(L.avs_save_string.?),
-    };
+    inline for (@typeInfo(Api).@"struct".fields) |f| {
+        const sym = @field(L, "avs_" ++ f.name) orelse return false;
+        @field(api, f.name) = @ptrCast(sym);
+    }
+    return true;
 }
 
 const FilterData = struct {
@@ -452,7 +446,11 @@ fn pluginInit(env: ?*Env) [*c]const u8 {
     if (g_lib == null) {
         g_lib = bsrc_load_avs_library();
         if (g_lib == null) return "BRAWSource: failed to load the AviSynth library";
-        loadApi();
+    }
+    if (!api_ok) api_ok = loadApi();
+    if (!api_ok) {
+        // don't register the filter: every call path needs the V8 API
+        return "BRAWSource: this AviSynth host lacks the interface V8 frame-property API (AviSynth+ 3.6 or newer required)";
     }
     _ = api.add_function(env, "BRAWSource", params_string, @ptrCast(@alignCast(bsrc_apply_func().?)), null);
     return "Blackmagic RAW source";

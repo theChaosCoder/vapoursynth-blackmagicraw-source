@@ -373,7 +373,13 @@ fn cbReadComplete(_: *anyopaque, job: *api.IBlackmagicRawJob, hr: api.HRESULT, f
         return failAndSignal(req, dhr, "create decode job");
     }
     const dj = decode_job.?;
-    _ = dj.v.setUserData(dj, req);
+    // an unset user data pointer would strand the request forever: the
+    // completion callback couldn't find it to signal the event
+    const uhr = dj.v.setUserData(dj, req);
+    if (uhr != api.S_OK) {
+        api.release(dj);
+        return failAndSignal(req, uhr, "set decode job user data");
+    }
     const shr2 = dj.v.submit(dj);
     if (shr2 != api.S_OK) {
         api.release(dj);
@@ -755,7 +761,12 @@ pub const Decoder = struct {
             .callback = .{ .v = &callback_vtable, .decoder = self },
             .pipeline = opts.pipeline,
             .cuda_direct = envFlag("BRAW_CUDA_DIRECT", true),
-            .cuda_pin = envFlag("BRAW_CUDA_PIN", true),
+            // OFF by default: registering host-owned (VS) frame planes is
+            // ~25% faster DtoH, but the registrations outlive our control —
+            // after close+reopen in one process cuCtxCreate fails with
+            // CUDA_ERROR_ALREADY_MAPPED (orphaned page-locks on recycled
+            // buffers). Opt in per env when the process opens one clip once.
+            .cuda_pin = envFlag("BRAW_CUDA_PIN", false),
             .cuda_stream = envFlag("BRAW_CUDA_STREAM", true),
             .ocl_direct = envFlag("BRAW_OCL_DIRECT", true),
             // provisional when depth is auto; finalized in collectClipInfo
@@ -821,7 +832,12 @@ pub const Decoder = struct {
             }
         }
 
-        _ = self.codec.setCallback(@ptrCast(&self.callback));
+        // without the callback every submitted job would complete into the
+        // void and each decodeFrame would hang; refuse to open instead
+        if (self.codec.setCallback(@ptrCast(&self.callback)) != api.S_OK) {
+            err_detail.* = std.fmt.allocPrint(gpa, "the SDK rejected the completion callback (SetCallback failed)", .{}) catch null;
+            return error.CodecFailed;
+        }
 
         var path_s = strings.make(gpa, path) catch return error.OutOfMemory;
         defer path_s.deinit(gpa);
@@ -1270,7 +1286,12 @@ pub const Decoder = struct {
         var job_opt: ?*api.IBlackmagicRawJob = null;
         if (self.clip.v.createJobReadFrame(self.clip, n, &job_opt) != api.S_OK) return error.DecodeFailed;
         const job = job_opt orelse return error.DecodeFailed;
-        _ = job.v.setUserData(job, req);
+        // without user data the callback can't find the request and the
+        // event would never be signaled (permanent hang in waitRequest)
+        if (job.v.setUserData(job, req) != api.S_OK) {
+            api.release(job);
+            return error.DecodeFailed;
+        }
         if (job.v.submit(job) != api.S_OK) {
             api.release(job);
             return error.DecodeFailed;
@@ -1316,8 +1337,16 @@ pub const Decoder = struct {
         // CUDA: either DtoH each already-planar device plane straight into
         // the frame plane (no staging buffer, no CPU copy), or stage through
         // a pinned buffer for formats that need CPU conversion.
+        // Direct paths derive their device plane geometry from the resource
+        // size, so they additionally require the size to be EXACTLY the
+        // tightly-packed layout — a padded buffer silently lands misaligned
+        // planes. The staging paths read the expected layout from the front
+        // (copyImage tolerates trailing slack), so they stay the fallback.
+        const size_exact = req.pending.size ==
+            formats.expectedSizeBytes(req.resource_format, dest.width, dest.height);
+
         if (p.cuda_dev) |dev| {
-            if (self.cuda_direct and directCopyEligible(req.resource_format, self.depth)) {
+            if (self.cuda_direct and size_exact and directCopyEligible(req.resource_format, self.depth)) {
                 self.copyCudaPlanesDirect(req, dest, dev);
             } else {
                 self.cudaStagingCopy(req, dest, dev);
@@ -1328,7 +1357,7 @@ pub const Decoder = struct {
         // OpenCL: same split as CUDA — ReadBufferRect straight into the
         // frame planes for the planar formats, pinned staging otherwise.
         if (p.ocl_mem) |mem| {
-            if (self.ocl_direct and !self.ocl_direct_broken.load(.monotonic) and
+            if (self.ocl_direct and size_exact and !self.ocl_direct_broken.load(.monotonic) and
                 directCopyEligible(req.resource_format, self.depth))
             {
                 self.copyOclPlanesDirect(req, dest, mem);
@@ -1453,15 +1482,26 @@ pub const Decoder = struct {
                 .height = dest.height,
             };
         }
-        // release the queue before the staging fallback borrows its own
+        // release (or on QueueBroken destroy) the queue before the staging
+        // fallback borrows its own
         const copy_result = blk: {
             const queue = self.acquireOclQueue() orelse ctx.service_queue;
-            defer if (queue != ctx.service_queue) self.releaseOclQueue(queue);
-            break :blk ctx.copyPlanesToHost(queue, mem, &planes);
+            const r = ctx.copyPlanesToHost(queue, mem, &planes);
+            if (queue != ctx.service_queue) {
+                const broken = if (r) |_| false else |e| e == error.QueueBroken;
+                if (broken) ctx.destroyQueue(queue) else self.releaseOclQueue(queue);
+            }
+            break :blk r;
         };
         copy_result catch |e| {
             _ = self.gpu_slow.fetchAdd(1, .monotonic);
             if (e == error.HostAccessForbidden) self.ocl_direct_broken.store(true, .monotonic);
+            if (e == error.QueueBroken) {
+                // commands may still be writing the frame planes; the device
+                // is effectively lost — fail instead of racing a fallback
+                req.fail(api.E_FAIL, "GPU readback (OpenCL queue broken)");
+                return;
+            }
             self.oclStagingCopy(req, dest, mem);
             return;
         };
@@ -1479,14 +1519,27 @@ pub const Decoder = struct {
             req.oom = true;
             return;
         };
-        defer self.releaseOclStaging(stg);
         const queue = self.acquireOclQueue() orelse ctx.service_queue;
-        defer if (queue != ctx.service_queue) self.releaseOclQueue(queue);
-        const src = ctx.stageAndMap(queue, mem, stg, size) catch {
+        // QueueBroken means the queue may still hold in-flight work touching
+        // the staging buffer — destroy both instead of pooling them.
+        var broken = false;
+        defer {
+            if (broken) {
+                if (queue != ctx.service_queue) ctx.destroyQueue(queue);
+                ctx.destroyStaging(stg);
+            } else {
+                if (queue != ctx.service_queue) self.releaseOclQueue(queue);
+                self.releaseOclStaging(stg);
+            }
+        }
+        const src = ctx.stageAndMap(queue, mem, stg, size) catch |e| {
+            broken = (e == error.QueueBroken);
             req.fail(api.E_FAIL, "GPU readback (clEnqueueCopyBuffer/Map)");
             return;
         };
-        defer ctx.unmapStaging(queue, stg, src);
+        defer ctx.unmapStaging(queue, stg, src) catch {
+            broken = true;
+        };
         formats.copyImage(req.resource_format, src, size, dest, self.depth) catch |e| {
             req.fail(api.E_FAIL, switch (e) {
                 error.SizeMismatch => "resource size mismatch (padded buffer?)",

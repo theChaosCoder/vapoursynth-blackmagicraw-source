@@ -19,7 +19,14 @@ on an RTX 3080 (Ryzen 5 9600X, PCIe gen4 x16), Metal on an Apple M1 Pro
   `OpenClip`. The decoded `IBlackmagicRawProcessedImage` lives in GPU memory;
   the decoder reads it back with `cuMemcpyDtoH` into a **pinned** host
   staging buffer (pooled, since pinned allocation is expensive), then the
-  existing plane-copy path writes it into the host frame.
+  existing plane-copy path writes it into the host frame. Planar formats
+  skip the staging buffer entirely (`cuMemcpy2D` straight into the frame
+  planes). Page-locking the frame planes themselves (`BRAW_CUDA_PIN=1`,
+  ~25% faster DtoH) is **off by default**: the registrations pin
+  host-owned memory whose lifetime the plugin doesn't control, and after
+  a close+reopen in the same process `cuCtxCreate` fails with
+  `CUDA_ERROR_ALREADY_MAPPED`. Enable it only when the process opens one
+  clip once (batch transcode).
 - **Metal**: the SDK creates the device (`CreatePipelineDeviceIterator(Metal,
   InteropNone)` → `CreateDevice` → `SetFromDevice`). The decoded image is a
   private (GPU-only) `MTLBuffer`; `src/core/braw/metal.zig` blits it into a
