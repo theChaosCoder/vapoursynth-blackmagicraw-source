@@ -145,7 +145,11 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    const a = parseArgs(init.minimal.args, gpa);
+    // args live for the whole process; an arena keeps the debug allocator's
+    // leak report clean without threading frees through parseArgs
+    var args_arena = std.heap.ArenaAllocator.init(gpa);
+    defer args_arena.deinit();
+    const a = parseArgs(init.minimal.args, args_arena.allocator());
     const clip_path = a.clip orelse fatal("usage: braw-probe [options] <clip.braw>", .{});
 
     var stdout_buf: [4096]u8 = undefined;

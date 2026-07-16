@@ -954,6 +954,9 @@ pub const Decoder = struct {
         _ = clip.v.getHeight(clip, &h);
         _ = clip.v.getFrameRate(clip, &rate);
         _ = clip.v.getFrameCount(clip, &count);
+        // failed getters leave their out-params at 0; a 0x0 clip would ripple
+        // NaNs/div-by-zero through geometry and frame allocation downstream
+        if (w == 0 or h == 0) return error.OpenClipFailed;
 
         var camera_raw: api.StringRaw = null;
         if (clip.v.getCameraType(clip, &camera_raw) == api.S_OK) {

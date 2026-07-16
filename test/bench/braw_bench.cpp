@@ -43,6 +43,7 @@ static const BlackmagicRawResourceFormat s_format = blackmagicRawResourceFormatR
 static int s_maxJobs = 3;
 static std::atomic<int> s_inFlight{0};
 static std::atomic<int> s_done{0};
+static std::atomic<int> s_failed{0};
 static CUcontext s_cudaCtx = nullptr;
 static bool s_cuda = false;
 static uint8_t* s_hostBuf = nullptr;
@@ -85,6 +86,8 @@ public:
             } else {
                 memcpy(s_hostBuf, resource, size);
             }
+        } else {
+            ++s_failed; // a failed decode must not count as benchmarked work
         }
         ++s_done;
         --s_inFlight;
@@ -124,7 +127,9 @@ int main(int argc, const char** argv) {
     const char* clipName = argv[1];
     s_cuda = strcmp(argv[2], "cuda") == 0;
     if (argc > 3) s_maxJobs = atoi(argv[3]);
+    if (s_maxJobs < 1) { fprintf(stderr, "maxJobs must be >= 1\n"); return 2; } // 0 spins forever
     int loops = (argc > 4) ? atoi(argv[4]) : 1;
+    if (loops < 1) loops = 1;
 
     const char* libDir = getenv("BRAW_LIBRARY");
     char libPath[4096];
@@ -191,8 +196,16 @@ int main(int argc, const char** argv) {
 
     clip->Release();
     codec->Release();
+    // must be released/freed while the context is still alive, and with the
+    // allocator that created it (cuMemAllocHost buffer must not go to free())
+    if (s_cuda) {
+        if (s_hostBuf) cuMemFreeHost(s_hostBuf);
+    } else {
+        free(s_hostBuf);
+    }
     if (s_cudaCtx) cuCtxDestroy_v2(s_cudaCtx);
     factory->Release();
-    free(s_hostBuf);
+    int failed = s_failed.load();
+    if (failed) { fprintf(stderr, "%d frames failed to decode\n", failed); return 1; }
     return 0;
 }

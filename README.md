@@ -74,7 +74,8 @@ Frame props: `_DurationNum/Den`, `_AbsoluteTime`, `_Matrix`, `_Range` (AviSynth:
 (+`_Transfer`/`_Primaries` when the gamma/gamut has a standard code), plus
 `BRAWTimecode`, `BRAWISO`, `BRAWWhiteBalanceKelvin/Tint`, `BRAWExposure`,
 camera/clip info as `BRAW*`. Inspect everything with
-`braw-probe --list-attrs --all-meta clip.braw`.
+`braw-probe --frame 0 --list-attrs --all-meta clip.braw` (built by
+`zig build` into `zig-out/bin/`; not part of the release packages).
 
 ## Building
 

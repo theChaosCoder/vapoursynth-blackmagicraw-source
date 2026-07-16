@@ -44,16 +44,23 @@ void *bsrc_apply_func(void) {
     return (void *)bsrc_create_trampoline;
 }
 
-/* Directory containing this DLL (for the BlackmagicRawAPI search path). */
+/* Directory containing this DLL (for the BlackmagicRawAPI search path).
+ * Wide API + UTF-8 conversion: the ANSI variant garbles non-ASCII install
+ * paths, which then fail the runtime search. The loader consumes UTF-8. */
 int bsrc_module_dir(char *buf, int len) {
     HMODULE mod = NULL;
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             (LPCSTR)&bsrc_module_dir, &mod))
         return 0;
-    DWORD n = GetModuleFileNameA(mod, buf, (DWORD)len);
-    if (n == 0 || n >= (DWORD)len)
+    WCHAR wbuf[MAX_PATH];
+    DWORD wn = GetModuleFileNameW(mod, wbuf, MAX_PATH);
+    if (wn == 0 || wn >= MAX_PATH)
         return 0;
+    int n = WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)wn, buf, len - 1, NULL, NULL);
+    if (n <= 0)
+        return 0;
+    buf[n] = 0;
     for (int i = (int)n - 1; i >= 0; i--) {
         if (buf[i] == '\\' || buf[i] == '/') {
             buf[i] = 0;

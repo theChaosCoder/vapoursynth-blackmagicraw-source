@@ -126,8 +126,11 @@ test "event cross-thread signaling" {
     var ev: Event = .{};
     const t = try std.Thread.spawn(.{}, struct {
         fn run(e: *Event) void {
-            var ts: std.c.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
-            _ = std.c.nanosleep(&ts, null);
+            // brief portable delay so the waiter is very likely parked
+            // before the set — an Event that is never signaled is the one
+            // sleep primitive this module already has on every platform
+            var pause: Event = .{};
+            pause.timedWait(5 * std.time.ns_per_ms) catch {};
             e.set();
         }
     }.run, .{&ev});

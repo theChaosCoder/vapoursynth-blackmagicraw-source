@@ -33,6 +33,7 @@ static std::atomic<int> s_done{0};
 static bool s_metal = false;
 static bool s_readback = true;
 static id<MTLCommandQueue> s_queue = nil;
+static IBlackmagicRawPipelineDevice* s_device = nullptr;
 static id<MTLBuffer> s_staging = nil;
 static uint8_t* s_hostBuf = nullptr;
 static uint32_t s_hostBufSize = 0;
@@ -125,7 +126,9 @@ static bool setupMetal(IBlackmagicRawFactory* factory, IBlackmagicRaw* codec) {
         return false;
     }
     s_queue = (__bridge id<MTLCommandQueue>)queue;
-    device->Release(); // queue stays alive with the SDK's device manager
+    // keep the device alive until after the codec is released: the codec's
+    // pipeline (and our borrowed queue) are backed by it
+    s_device = device;
     return true;
 }
 
@@ -134,7 +137,9 @@ int main(int argc, const char** argv) {
     const char* clipName = argv[1];
     s_metal = strcmp(argv[2], "metal") == 0;
     if (argc > 3) s_maxJobs = atoi(argv[3]);
+    if (s_maxJobs < 1) { fprintf(stderr, "maxJobs must be >= 1\n"); return 2; } // 0 spins forever
     int loops = (argc > 4) ? atoi(argv[4]) : 1;
+    if (loops < 1) loops = 1;
     for (int i = 3; i < argc; i++)
         if (strcmp(argv[i], "--no-readback") == 0) s_readback = false;
 
@@ -198,6 +203,7 @@ int main(int argc, const char** argv) {
 
     clip->Release();
     codec->Release();
+    if (s_device) s_device->Release();
     factory->Release();
     free(s_hostBuf);
     return 0;

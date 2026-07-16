@@ -1,5 +1,11 @@
 # Plan: Dual VapourSynth / AviSynth+ Source Plugin for Blackmagic RAW (Zig)
 
+> **Historical document.** This is the original implementation plan (v1,
+> CPU-only). The shipped architecture has moved on — GPU pipelines
+> (CUDA/Metal/OpenCL), `fmParallel`, deferred plane copies and requester-side
+> readback are documented in `doc/gpu-benchmark.md` and the module doc
+> comments, which are authoritative. Kept for the ABI research notes.
+
 Status: M0–M8 implemented (2026-07-02). Linux fully tested (56 integration
 checks incl. byte-exact oracle comparison); Windows (VS + AviSynth) and macOS
 artifacts cross-compile, runtime validation on real hosts pending. GitHub

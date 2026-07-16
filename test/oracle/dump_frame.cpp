@@ -53,9 +53,11 @@ public:
                 image->GetResourceSizeBytes(&sizeBytes) == S_OK) {
                 FILE* f = fopen(g_outPath, "wb");
                 if (f) {
-                    fwrite(resource, 1, sizeBytes, f);
-                    fclose(f);
-                    g_result = 0;
+                    // short write / failed flush must not exit 0 (a truncated
+                    // dump silently passes the byte-exact comparison setup)
+                    size_t written = fwrite(resource, 1, sizeBytes, f);
+                    int rc = fclose(f);
+                    if (written == sizeBytes && rc == 0) g_result = 0;
                 }
             }
         }
@@ -94,19 +96,20 @@ static int dumpAudio(IBlackmagicRawClip* clip, const char* outPath)
     if (!f) return 1;
 
     uint64_t index = 0;
+    bool write_ok = true;
     while (index < sampleCount) {
         uint32_t samplesRead = 0, bytesRead = 0;
         if (audio->GetAudioSamples((int64_t)index, buf, bufSize, chunk, &samplesRead, &bytesRead) != S_OK)
             break;
         if (samplesRead == 0)
             break;
-        fwrite(buf, 1, bytesRead, f);
+        if (fwrite(buf, 1, bytesRead, f) != bytesRead) { write_ok = false; break; }
         index += samplesRead;
     }
-    fclose(f);
+    if (fclose(f) != 0) write_ok = false; // flush errors (e.g. ENOSPC) count
     free(buf);
     audio->Release();
-    return index == sampleCount ? 0 : 1;
+    return (index == sampleCount && write_ok) ? 0 : 1;
 }
 
 int main(int argc, const char** argv)
