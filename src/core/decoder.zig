@@ -1433,8 +1433,11 @@ pub const Decoder = struct {
     /// retry next frame like the CUDA path.
     fn copyOclPlanesDirect(self: *Decoder, req: *Request, dest: *const formats.Dest, mem: opencl.Mem) void {
         const ctx = if (self.ocl_ctx) |*c| c else return;
-        const plane_bytes: usize = @as(usize, req.pending.size) / 3;
-        const wbytes = plane_bytes / dest.height;
+        const layout = opencl.planarLayout(req.pending.size, dest.height) orelse {
+            // padded/misreported buffer: rect addressing would misalign
+            self.oclStagingCopy(req, dest, mem);
+            return;
+        };
         var planes: [3]opencl.PlaneCopy = undefined;
         var i: usize = 0;
         while (i < 3) : (i += 1) {
@@ -1446,7 +1449,7 @@ pub const Decoder = struct {
                 .dst = dp,
                 .dst_pitch = dest.strides[i],
                 .origin_y = i * dest.height,
-                .width_bytes = wbytes,
+                .width_bytes = layout.width_bytes,
                 .height = dest.height,
             };
         }
@@ -1627,4 +1630,28 @@ fn moveReqMeta(req: *Request, out: *FrameMeta) void {
 
 test {
     _ = @import("braw/api.zig");
+    _ = @import("braw/opencl.zig");
+}
+
+test "Pipeline.parse: all backends, case-insensitive, no opengl" {
+    try std.testing.expectEqual(Pipeline.cpu, Pipeline.parse("cpu").?);
+    try std.testing.expectEqual(Pipeline.cuda, Pipeline.parse("CUDA").?);
+    try std.testing.expectEqual(Pipeline.metal, Pipeline.parse("Metal").?);
+    try std.testing.expectEqual(Pipeline.opencl, Pipeline.parse("OpenCL").?);
+    // the SDK has no OpenGL decode pipeline (display interop only)
+    try std.testing.expectEqual(@as(?Pipeline, null), Pipeline.parse("opengl"));
+    try std.testing.expectEqual(@as(?Pipeline, null), Pipeline.parse(""));
+}
+
+test "directCopyEligible: verbatim planar copies only" {
+    // planar formats copy verbatim
+    try std.testing.expect(directCopyEligible(.rgb_u16_planar, .u16_));
+    try std.testing.expect(directCopyEligible(.rgb_f16_planar, .f16));
+    try std.testing.expect(directCopyEligible(.rgb_f32_planar, .f32_));
+    // f32 -> f16 narrowing needs a CPU pass
+    try std.testing.expect(!directCopyEligible(.rgb_f32_planar, .f16));
+    // interleaved formats need a CPU de-interleave
+    try std.testing.expect(!directCopyEligible(.rgba_u8, .u8_));
+    try std.testing.expect(!directCopyEligible(.rgba_f16, .f16));
+    try std.testing.expect(!directCopyEligible(.rgb_u16, .u16_));
 }

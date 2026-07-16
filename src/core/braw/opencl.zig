@@ -67,6 +67,23 @@ pub const PlaneCopy = struct {
     height: usize,
 };
 
+pub const PlanarLayout = struct {
+    plane_bytes: usize,
+    width_bytes: usize,
+};
+
+/// Split a tightly-packed 3-plane device buffer into per-plane geometry
+/// for PlaneCopy. Returns null when the buffer cannot be three equal
+/// planes of whole rows (padded or misreported size) — rect addressing
+/// with origin_y = i*height would then read from the wrong offsets.
+pub fn planarLayout(total_size: usize, height: usize) ?PlanarLayout {
+    if (total_size == 0 or height == 0) return null;
+    if (total_size % 3 != 0) return null;
+    const plane_bytes = total_size / 3;
+    if (plane_bytes % height != 0) return null;
+    return .{ .plane_bytes = plane_bytes, .width_bytes = plane_bytes / height };
+}
+
 const Fns = struct {
     getCommandQueueInfo: *const fn (Queue, u32, usize, ?*anyopaque, ?*usize) callconv(.c) i32,
     retainContext: *const fn (ClContext) callconv(.c) i32,
@@ -313,3 +330,45 @@ pub const Context = struct {
         _ = f.finish(queue);
     }
 };
+
+// ---------------------------------------------------------------------------
+
+test "cl constants match the OpenCL spec" {
+    // Values fixed by cl.h; a typo here turns into silent misbehavior at
+    // the driver boundary, so pin them (same idea as api.zig's fourcc test).
+    try std.testing.expectEqual(@as(i32, -59), CL_INVALID_OPERATION);
+    try std.testing.expectEqual(@as(u32, 0x1090), CL_QUEUE_CONTEXT);
+    try std.testing.expectEqual(@as(u32, 0x1091), CL_QUEUE_DEVICE);
+    try std.testing.expectEqual(@as(u64, 1 << 0), CL_MEM_READ_WRITE);
+    try std.testing.expectEqual(@as(u64, 1 << 4), CL_MEM_ALLOC_HOST_PTR);
+    try std.testing.expectEqual(@as(u64, 1 << 0), CL_MAP_READ);
+    try std.testing.expectEqual(@as(u32, 1), CL_TRUE);
+    try std.testing.expectEqual(@as(u32, 0), CL_FALSE);
+}
+
+test "copyError: only host-access rejection is permanent" {
+    try std.testing.expectEqual(Error.HostAccessForbidden, copyError(CL_INVALID_OPERATION));
+    try std.testing.expectEqual(Error.CopyFailed, copyError(-5)); // CL_OUT_OF_RESOURCES
+    try std.testing.expectEqual(Error.CopyFailed, copyError(-36)); // CL_INVALID_COMMAND_QUEUE
+}
+
+test "planarLayout: splits tightly-packed 3-plane buffers" {
+    // 4.6K u16 planar frame
+    const l = planarLayout(4608 * 2592 * 2 * 3, 2592).?;
+    try std.testing.expectEqual(@as(usize, 4608 * 2592 * 2), l.plane_bytes);
+    try std.testing.expectEqual(@as(usize, 4608 * 2), l.width_bytes);
+    // rect-addressing invariant: origin_y = i*height with row pitch =
+    // width_bytes must land exactly at plane i's byte offset
+    try std.testing.expectEqual(l.plane_bytes, 2592 * l.width_bytes);
+
+    // f32 planar, small odd dimensions
+    const f = planarLayout(7 * 3 * 4 * 3, 3).?;
+    try std.testing.expectEqual(@as(usize, 7 * 4), f.width_bytes);
+}
+
+test "planarLayout: rejects padded or misreported sizes" {
+    try std.testing.expect(planarLayout(100, 3) == null); // not 3 equal planes
+    try std.testing.expect(planarLayout(99, 10) == null); // plane not whole rows
+    try std.testing.expect(planarLayout(0, 10) == null);
+    try std.testing.expect(planarLayout(300, 0) == null);
+}
