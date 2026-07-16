@@ -1,11 +1,11 @@
 # brawsource (beta)
 
 Dual VapourSynth / AviSynth+ source plugin for Blackmagic RAW (`.braw`),
-written in Zig against the official Blackmagic RAW SDK (CPU decode).
+written in Zig against the official Blackmagic RAW SDK (CPU + GPU decode).
 Frame-exact random access, audio, frame properties from clip/frame metadata.
 
-- **VapourSynth**: `braw.Source` + `braw.AudioSource` — Linux, Windows, macOS (x64/arm64)
-- **AviSynth+**: `BRAWSource` (video + audio track) — Windows x64
+- **VapourSynth**: `braw.Source` + `braw.AudioSource` — Linux x64, Windows x64, macOS (x64/arm64)
+- **AviSynth+**: `BRAWSource` (video + audio track) — Windows x64, AviSynth+ 3.6+ (interface V8)
 
 ![sample.braw decoded in VS View, frame properties from the clip metadata](doc/brawsource.jpg)
 
@@ -20,6 +20,10 @@ pip install vapoursynth-brawsource
 
 The wheels are baseline x86-64; for the faster `-v3` builds (AVX2/F16C)
 or the AviSynth+ plugin, grab a release zip below.
+
+System requirements: macOS 12+ (the BRAW 5.1 runtime's floor). On Linux
+the bundled runtime additionally needs the system `libGL.so.1` (Mesa) and
+`libuuid.so.1` — present on practically every desktop distribution.
 
 ## Runtime
 

@@ -74,19 +74,26 @@ Blackmagic RAW SDK Developer License, clause 1.1(d)
 # (release label, plugin binary, runtime dir, platform tag)
 #
 # Platform tags follow PEP 425. Zig cross-compiles the Linux build
-# against glibc 2.17, hence manylinux2014/manylinux_2_17. The macOS
-# floor is Big Sur (11.0) — the oldest macOS the Blackmagic RAW runtime
-# supports on either architecture.
+# against glibc 2.17, hence manylinux2014/manylinux_2_17 for the plugin
+# itself; the bundled BRAW runtime additionally needs system libGL and
+# libuuid at dlopen time (see README). The macOS floor is Monterey
+# (12.0): the BRAW 5.1 runtime is built with minos 12.0 and the plugin
+# dylibs are built with os_version_min 12.0 (build.zig) — the tag, the
+# plugin and the runtime must agree or dyld refuses to load.
 PLATFORMS = [
     ("vapoursynth-linux-x86_64", "libbrawsource.so",
      "linux-x86_64", "manylinux2014_x86_64.manylinux_2_17_x86_64"),
     ("vapoursynth-windows-x86_64", "brawsource.dll",
      "windows-x86_64", "win_amd64"),
     ("vapoursynth-macos-x86_64", "libbrawsource.dylib",
-     "macos-universal", "macosx_11_0_x86_64"),
+     "macos-universal", "macosx_12_0_x86_64"),
     ("vapoursynth-macos-arm64", "libbrawsource.dylib",
-     "macos-universal", "macosx_11_0_arm64"),
+     "macos-universal", "macosx_12_0_arm64"),
 ]
+
+# Fixed timestamp for all zip members so two builds of the same inputs
+# produce byte-identical wheels (1980-01-01 is the zip format's epoch).
+ZIP_DATE = (1980, 1, 1, 0, 0, 0)
 
 
 def project_version() -> str:
@@ -178,11 +185,47 @@ def _runtime_entries(runtime_dir: Path, deps_prefix: str) -> list[tuple[str, byt
     return entries
 
 
+def _macho_minos(data: bytes) -> tuple[int, int] | None:
+    """Minimum macOS version from LC_BUILD_VERSION/LC_VERSION_MIN_MACOSX
+    (thin Mach-O only)."""
+    import struct
+    if len(data) < 32 or struct.unpack_from("<I", data)[0] not in (0xFEEDFACF,):
+        return None
+    ncmds = struct.unpack_from("<I", data, 16)[0]
+    pos = 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, pos)
+        if cmd in (0x32, 0x24):  # LC_BUILD_VERSION / LC_VERSION_MIN_MACOSX
+            v = struct.unpack_from("<I", data, pos + (12 if cmd == 0x32 else 8))[0]
+            return (v >> 16, (v >> 8) & 0xFF)
+        pos += cmdsize
+    return None
+
+
+def _check_macos_tag(src: Path, plat_tag: str) -> None:
+    """A macosx_X_Y tag on a binary that needs a newer macOS makes pip
+    install wheels that dyld then refuses to load — hard error."""
+    m = re.match(r"macosx_(\d+)_(\d+)_", plat_tag)
+    if not m:
+        return
+    tag_ver = (int(m.group(1)), int(m.group(2)))
+    minos = _macho_minos(src.read_bytes())
+    if minos is None:
+        raise SystemExit(f"cannot read LC_BUILD_VERSION from {src}")
+    if minos > tag_ver:
+        raise SystemExit(
+            f"{src.name}: minos {minos[0]}.{minos[1]} exceeds wheel tag "
+            f"macosx_{tag_ver[0]}_{tag_ver[1]} - fix os_version_min in build.zig "
+            "or the tag in PLATFORMS"
+        )
+
+
 def build_wheel(version: str, label: str, binname: str,
                 runtime: str, plat_tag: str) -> Path:
     src = RELEASE / label / binname
     if not src.exists():
         raise SystemExit(f"missing artefact: {src}\n  run `zig build release` first.")
+    _check_macos_tag(src, plat_tag)
     runtime_dir = RUNTIME / runtime
     if not runtime_dir.exists():
         raise SystemExit(f"missing runtime: {runtime_dir}\n  run tools/extract-sdk.sh first.")
@@ -201,7 +244,18 @@ def build_wheel(version: str, label: str, binname: str,
         (f"{distinfo}/METADATA", _metadata(version).encode("utf-8")),
         (f"{distinfo}/WHEEL", _wheel_file(plat_tag).encode("utf-8")),
         (f"{distinfo}/licenses/LICENSE", (ROOT / "LICENSE").read_bytes()),
+        (f"{distinfo}/licenses/THIRD_PARTY_NOTICES.md",
+         (ROOT / "THIRD_PARTY_NOTICES.md").read_bytes()),
     ]
+    for lic in sorted((ROOT / "THIRD_PARTY_LICENSES").iterdir()):
+        entries.append((f"{distinfo}/licenses/THIRD_PARTY_LICENSES/{lic.name}", lic.read_bytes()))
+    # the SDK's own license + attribution documents belong next to its libs
+    sdk_docs = ROOT / "third_party/braw/sdk/Documents"
+    for doc in ("License.rtf", "Third Party Licenses.rtf"):
+        p = sdk_docs / doc
+        if not p.exists():
+            raise SystemExit(f"missing SDK license document: {p} (rerun tools/extract-sdk.sh)")
+        entries.append((f"{libs}/{doc}", p.read_bytes()))
 
     # Build RECORD last — it indexes everything else.
     record_lines = [f"{name},{_sha256_b64(data)},{len(data)}" for name, data in entries]
@@ -211,17 +265,43 @@ def build_wheel(version: str, label: str, binname: str,
 
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in entries:
-            zf.writestr(name, data)
+            # fixed metadata -> reproducible wheels (same inputs, same bytes)
+            info = zipfile.ZipInfo(name, date_time=ZIP_DATE)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            zf.writestr(info, data)
 
     print(f"  built {out.name}  ({out.stat().st_size:>9d} bytes, {len(entries)} files)")
     return out
 
 
+def _audit_linux_wheel(wheel: Path) -> None:
+    """Release gate: run auditwheel against the Linux wheel when it is
+    installed. Advisory (the BRAW runtime intentionally links system
+    libGL/libuuid, which auditwheel flags), but the report must be seen."""
+    import shutil
+    import subprocess
+    if shutil.which("auditwheel") is None:
+        print("  WARNING: auditwheel not installed - manylinux tag unverified")
+        return
+    res = subprocess.run(["auditwheel", "show", str(wheel)],
+                         capture_output=True, text=True)
+    print("  auditwheel show:")
+    for line in (res.stdout + res.stderr).strip().splitlines():
+        print(f"    {line}")
+
+
 def main() -> int:
     version = project_version()
     print(f"Building {PROJECT_NAME} {version} wheels")
+    # stale wheels from previous versions must not linger next to new ones
+    if DIST.exists():
+        for old in DIST.glob(f"{DIST_NAME}-*.whl"):
+            old.unlink()
     for label, binname, runtime, plat_tag in PLATFORMS:
-        build_wheel(version, label, binname, runtime, plat_tag)
+        wheel = build_wheel(version, label, binname, runtime, plat_tag)
+        if "manylinux" in plat_tag:
+            _audit_linux_wheel(wheel)
     print(f"\n{len(PLATFORMS)} wheels in {DIST.relative_to(ROOT)}/")
     return 0
 

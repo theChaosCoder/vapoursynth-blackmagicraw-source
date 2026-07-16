@@ -41,7 +41,11 @@ package() { # <label> <deps-dir-name> <runtime-src...>
         cp -r "$src" "$stage/$deps/"
     done
     write_notice "$stage/$deps"
-    cp "$REPO/README.md" "$REPO/LICENSE" "$stage/"
+    # SDK license + attribution documents live next to the SDK libraries
+    cp "$REPO/third_party/braw/sdk/Documents/License.rtf" \
+       "$REPO/third_party/braw/sdk/Documents/Third Party Licenses.rtf" "$stage/$deps/"
+    cp -r "$REPO/THIRD_PARTY_LICENSES" "$stage/"
+    cp "$REPO/README.md" "$REPO/LICENSE" "$REPO/THIRD_PARTY_NOTICES.md" "$stage/"
     (cd "$stage" && 7z a -tzip -mx=9 "$OUT/brawsource-$VER-$label.zip" ./* >/dev/null)
     echo "packaged brawsource-$VER-$label.zip"
 }

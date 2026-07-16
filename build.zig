@@ -122,19 +122,29 @@ pub fn build(b: *std.Build) void {
         .{ .q = .{ .cpu_arch = .x86_64, .cpu_model = v3_model, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 17, .patch = 0 } }, .label = "release/vapoursynth-linux-x86_64-v3" },
         .{ .q = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }, .label = "release/vapoursynth-windows-x86_64" },
         .{ .q = .{ .cpu_arch = .x86_64, .cpu_model = v3_model, .os_tag = .windows, .abi = .gnu }, .label = "release/vapoursynth-windows-x86_64-v3" },
-        .{ .q = .{ .cpu_arch = .x86_64, .cpu_model = .{ .explicit = &std.Target.x86.cpu.ivybridge }, .os_tag = .macos }, .label = "release/vapoursynth-macos-x86_64" },
-        .{ .q = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .label = "release/vapoursynth-macos-arm64" },
+        // macOS floor = 12.0: the bundled BRAW 5.1 runtime is built with
+        // minos 12.0, and Zig's default (13.0) would contradict the wheel
+        // platform tags (macosx_12_0). Keep all three in sync.
+        .{ .q = .{ .cpu_arch = .x86_64, .cpu_model = .{ .explicit = &std.Target.x86.cpu.ivybridge }, .os_tag = .macos, .os_version_min = .{ .semver = .{ .major = 12, .minor = 0, .patch = 0 } } }, .label = "release/vapoursynth-macos-x86_64" },
+        .{ .q = .{ .cpu_arch = .aarch64, .os_tag = .macos, .os_version_min = .{ .semver = .{ .major = 12, .minor = 0, .patch = 0 } } }, .label = "release/vapoursynth-macos-arm64" },
     };
     const release = b.step("release", "Build all release artifacts (ReleaseFast)");
+    // releases must never ship with failing unit tests
+    release.dependOn(&b.addRunArtifact(core_tests).step);
     for (release_targets) |rt| {
         const rlib = addVsLib(b, core_mod, b.resolveTargetQuery(rt.q), .ReleaseFast);
+        // no debug sections / absolute build paths in shipped binaries;
+        // stripped builds are also byte-reproducible across checkouts
+        rlib.root_module.strip = true;
         release.dependOn(&installTo(b, rlib, rt.label).step);
     }
     const avs_release = addAvsLib(b, core_mod, b.resolveTargetQuery(avs_target_query), .ReleaseFast);
+    avs_release.root_module.strip = true;
     release.dependOn(&installTo(b, avs_release, "release/avisynth-windows-x86_64").step);
     var avs_v3_query = avs_target_query;
     avs_v3_query.cpu_model = v3_model;
     const avs_release_v3 = addAvsLib(b, core_mod, b.resolveTargetQuery(avs_v3_query), .ReleaseFast);
+    avs_release_v3.root_module.strip = true;
     release.dependOn(&installTo(b, avs_release_v3, "release/avisynth-windows-x86_64-v3").step);
 }
 
