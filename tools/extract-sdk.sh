@@ -38,6 +38,18 @@ WIN_ZIP="$SRC/Blackmagic_RAW_Windows_5.1.zip"
 [ -f "$LINUX_TAR" ] || { echo "error: $LINUX_TAR not found" >&2; exit 1; }
 [ -f "$WIN_ZIP" ] || { echo "error: $WIN_ZIP not found" >&2; exit 1; }
 
+# Authenticate the release inputs: everything extracted here ends up inside
+# the shipped wheels/zips, so a swapped or corrupted archive must not pass
+# silently. The manifest pins the exact SDK 5.1 downloads this repo builds
+# against; BRAW_SDK_SKIP_VERIFY=1 bypasses it for other SDK versions.
+MANIFEST="$REPO/tools/sdk-manifest.sha256"
+if [ "${BRAW_SDK_SKIP_VERIFY:-0}" != "1" ]; then
+    (cd "$SRC" && sha256sum -c "$MANIFEST" --strict) || {
+        echo "error: SDK archive checksum mismatch (set BRAW_SDK_SKIP_VERIFY=1 to override for a different SDK version)" >&2
+        exit 1
+    }
+fi
+
 # The SDK archive contains directories with mode 0444; make a tree
 # traversable/writable so it can be copied and deleted.
 fix_perms() {

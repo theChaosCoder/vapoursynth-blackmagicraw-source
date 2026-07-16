@@ -290,12 +290,17 @@ def gpu_pipeline_check(pipeline):
     """
     import array
 
+    global skipped
     try:
         gpu = open_clip(PORTRAIT, pipeline=pipeline)
         gf = gpu.get_frame(0)
     except vs.Error as e:
-        if pipeline.upper() in str(e).upper() or "unavailable" in str(e).lower():
+        # only clear device absence is skippable; any other GPU error
+        # (decode failure, readback failure) must fail the suite
+        msg = str(e).lower()
+        if any(s in msg for s in ("unavailable", "not available", "could not be loaded")):
             print(f"  SKIP: no {pipeline} device")
+            skipped += 1
             return
         raise
 
@@ -363,7 +368,12 @@ def main():
         print(f"-- {t.__name__}")
         t()
 
-    print(f"OK: {passed} checks passed, {skipped} suites skipped")
+    print(f"OK: {passed} checks passed, {skipped} suites/devices skipped")
+    if skipped and os.environ.get("BRAW_TEST_STRICT"):
+        # CI mode: missing fixtures or devices are a failure, not a pass —
+        # a green run must mean everything actually ran
+        print("FAIL: BRAW_TEST_STRICT is set and skips occurred", file=sys.stderr)
+        return 1
     return 0
 
 

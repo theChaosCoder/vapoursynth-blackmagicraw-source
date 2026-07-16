@@ -295,6 +295,14 @@ test "candidate paths: explicit file wins" {
 }
 
 test "candidate paths: per-os deps dir first, then pip libs, then fallbacks" {
+    // hermetic: a developer's BRAW_LIBRARY would short-circuit the
+    // candidate list and fail the expectations below
+    if (comptime builtin.os.tag != .windows) {
+        const posix = struct {
+            extern "c" fn unsetenv([*:0]const u8) c_int;
+        };
+        _ = posix.unsetenv(env_var);
+    }
     const gpa = std.testing.allocator;
     const paths = try candidatePaths(gpa, null, "/plug");
     defer freeCandidates(gpa, paths);
