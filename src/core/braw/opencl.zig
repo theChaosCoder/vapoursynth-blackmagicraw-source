@@ -35,19 +35,18 @@ else
     "libOpenCL.so.1";
 
 pub const CL_SUCCESS: i32 = 0;
+// Host access forbidden on the buffer (CL_MEM_HOST_WRITE_ONLY/NO_ACCESS):
+// deterministic per buffer flags, so the caller can stop retrying.
+const CL_INVALID_OPERATION: i32 = -59;
 
 // clGetCommandQueueInfo params
 const CL_QUEUE_CONTEXT: u32 = 0x1090;
 const CL_QUEUE_DEVICE: u32 = 0x1091;
 
-// clGetDeviceInfo params
-const CL_DEVICE_NAME: u32 = 0x102B;
-
 // cl_mem_flags / cl_map_flags (both cl_bitfield = u64)
 const CL_MEM_READ_WRITE: u64 = 1 << 0;
 const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
 const CL_MAP_READ: u64 = 1 << 0;
-const CL_MAP_WRITE: u64 = 1 << 1;
 
 const CL_TRUE: u32 = 1;
 const CL_FALSE: u32 = 0;
@@ -70,7 +69,6 @@ pub const PlaneCopy = struct {
 
 const Fns = struct {
     getCommandQueueInfo: *const fn (Queue, u32, usize, ?*anyopaque, ?*usize) callconv(.c) i32,
-    getDeviceInfo: *const fn (ClDevice, u32, usize, ?*anyopaque, ?*usize) callconv(.c) i32,
     retainContext: *const fn (ClContext) callconv(.c) i32,
     releaseContext: *const fn (ClContext) callconv(.c) i32,
     createCommandQueue: *const fn (ClContext, ClDevice, u64, *i32) callconv(.c) ?Queue,
@@ -108,7 +106,6 @@ fn load() void {
 
     fns = .{
         .getCommandQueueInfo = sym(@FieldType(Fns, "getCommandQueueInfo"), h, "clGetCommandQueueInfo") orelse return,
-        .getDeviceInfo = sym(@FieldType(Fns, "getDeviceInfo"), h, "clGetDeviceInfo") orelse return,
         .retainContext = sym(@FieldType(Fns, "retainContext"), h, "clRetainContext") orelse return,
         .releaseContext = sym(@FieldType(Fns, "releaseContext"), h, "clReleaseContext") orelse return,
         .createCommandQueue = sym(@FieldType(Fns, "createCommandQueue"), h, "clCreateCommandQueue") orelse return,
@@ -139,14 +136,27 @@ pub fn available() bool {
     return get() != null;
 }
 
-pub const Error = error{ OpenClUnavailable, ContextFailed, CopyFailed, OutOfMemory };
+/// HostAccessForbidden = CL_INVALID_OPERATION on a read/map: the buffer was
+/// created host-inaccessible. Deterministic per buffer, so callers disable
+/// the failing path instead of retrying every frame.
+pub const Error = error{ OpenClUnavailable, ContextFailed, CopyFailed, HostAccessForbidden, OutOfMemory };
 
 /// Print a failed CL call when BRAW_OCL_DEBUG is set (diagnosing driver
-/// quirks in the field without a debug build).
+/// quirks in the field without a debug build). Same off-values as the
+/// decoder's envFlag: 0/n/f.
 fn debugErr(what: []const u8, rc: i32) void {
     const v = std.c.getenv("BRAW_OCL_DEBUG") orelse return;
-    if (v[0] == '0' or v[0] == 0) return;
+    switch (v[0]) {
+        0, '0', 'n', 'N', 'f', 'F' => return,
+        else => {},
+    }
     std.debug.print("[braw-opencl] {s} failed: {d}\n", .{ what, rc });
+}
+
+/// Map a failed read/map result to the Error that tells the caller whether
+/// retrying can ever succeed.
+fn copyError(rc: i32) Error {
+    return if (rc == CL_INVALID_OPERATION) error.HostAccessForbidden else error.CopyFailed;
 }
 
 /// A pinned host-visible staging buffer (mapped per frame).
@@ -163,7 +173,7 @@ pub const Context = struct {
     context: ClContext,
     device: ClDevice,
     service_queue: Queue,
-    device_name: [256]u8 = [_]u8{0} ** 256,
+    destroyed: bool = false,
 
     /// Adopt the context/device behind the SDK's cl_command_queue. Retains
     /// the context so it outlives our queues even if the SDK device is
@@ -181,10 +191,9 @@ pub const Context = struct {
         if (f.retainContext(ctx.?) != CL_SUCCESS) return error.ContextFailed;
 
         var self: Context = .{ .context = ctx.?, .device = dev.?, .service_queue = undefined };
-        _ = f.getDeviceInfo(dev.?, CL_DEVICE_NAME, self.device_name.len - 1, &self.device_name, null);
-
         var err: i32 = CL_SUCCESS;
         self.service_queue = f.createCommandQueue(ctx.?, dev.?, 0, &err) orelse {
+            debugErr("clCreateCommandQueue", err);
             _ = f.releaseContext(ctx.?);
             return error.ContextFailed;
         };
@@ -192,22 +201,25 @@ pub const Context = struct {
     }
 
     pub fn destroy(self: *Context) void {
+        if (self.destroyed) return;
+        self.destroyed = true;
         const f = get() orelse return;
         _ = f.releaseCommandQueue(self.service_queue);
         _ = f.releaseContext(self.context);
     }
 
-    pub fn name(self: *const Context) []const u8 {
-        const n = std.mem.indexOfScalar(u8, &self.device_name, 0) orelse self.device_name.len;
-        return self.device_name[0..n];
-    }
-
     /// Create an in-order queue on the adopted context for readback,
     /// separate from the SDK's decode queue so transfers overlap decode.
+    /// Uses the OpenCL 1.x clCreateCommandQueue (deprecated in 2.0) on
+    /// purpose: it exists in every ICD, and default in-order behavior is
+    /// exactly what the copy paths need.
     pub fn createQueue(self: *const Context) Error!Queue {
         const f = get() orelse return error.OpenClUnavailable;
         var err: i32 = CL_SUCCESS;
-        return f.createCommandQueue(self.context, self.device, 0, &err) orelse error.ContextFailed;
+        return f.createCommandQueue(self.context, self.device, 0, &err) orelse {
+            debugErr("clCreateCommandQueue", err);
+            return error.ContextFailed;
+        };
     }
 
     pub fn destroyQueue(_: *const Context, q: Queue) void {
@@ -245,9 +257,11 @@ pub const Context = struct {
             if (rc != CL_SUCCESS) {
                 debugErr("clEnqueueReadBufferRect", rc);
                 _ = f.finish(queue); // drain queued copies before fallback
-                return error.CopyFailed;
+                return copyError(rc);
             }
         }
+        // A failing clFinish means the queue/context died (device lost) —
+        // same residual as the CUDA path's streamSync; nothing to drain.
         if (f.finish(queue) != CL_SUCCESS) return error.CopyFailed;
     }
 
@@ -275,13 +289,17 @@ pub const Context = struct {
         const f = get() orelse return error.OpenClUnavailable;
         const rc = f.enqueueCopyBuffer(queue, src, stg.mem, 0, 0, size, 0, null, null);
         if (rc != CL_SUCCESS) {
+            // rejected at enqueue: nothing in flight, no drain needed
             debugErr("clEnqueueCopyBuffer", rc);
             return error.CopyFailed;
         }
         var err: i32 = CL_SUCCESS;
         const ptr = f.enqueueMapBuffer(queue, stg.mem, CL_TRUE, CL_MAP_READ, 0, size, 0, null, null, &err) orelse {
             debugErr("clEnqueueMapBuffer", err);
-            return error.CopyFailed;
+            // the copy IS in flight: drain before the caller releases the
+            // source image and pools the staging buffer/queue
+            _ = f.finish(queue);
+            return copyError(err);
         };
         return @ptrCast(ptr);
     }

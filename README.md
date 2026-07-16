@@ -54,7 +54,7 @@ Parameters (both frameworks):
 | `bitdepth` | 8, 16 or 32 (32 = float). Unset = auto: 16-bit, or 32-bit float for Linear gamma. `fp=true` with 16 = half float (VapourSynth only) |
 | `audio` | AviSynth only: attach audio track (default true) |
 | `scale` | decode at 1/2/4/8 resolution |
-| `pipeline` | decode on `cpu` (default), `cuda` (NVIDIA, Linux/Windows), `metal` (Apple GPU, macOS) or `opencl` (any OpenCL GPU — the option for AMD/Intel). On Apple Silicon `metal` is 1.7-2.7x faster and leaves the CPU nearly idle; CUDA helps mainly at high resolution; `opencl` sits between CPU and CUDA (~1.6x CPU on an RTX 3080). See `doc/gpu-benchmark.md` |
+| `pipeline` | VapourSynth only: decode on `cpu` (default), `cuda` (NVIDIA, Linux/Windows), `metal` (Apple GPU, macOS) or `opencl` (any OpenCL GPU — the option for AMD/Intel). On Apple Silicon `metal` is 1.7-2.7x faster and leaves the CPU nearly idle; CUDA helps mainly at high resolution; `opencl` sits between CPU and CUDA (~1.6x CPU on an RTX 3080). See `doc/gpu-benchmark.md` |
 | `kelvin, tint, exposure, iso` | per-frame processing overrides |
 | `gamma, gamut, colorscience` | color science overrides (e.g. `gamma="Rec.709"`); invalid values error at open |
 | `highlightrecovery, gamutcompression` | processing toggles |

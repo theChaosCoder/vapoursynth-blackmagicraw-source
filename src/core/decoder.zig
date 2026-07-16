@@ -681,9 +681,10 @@ pub const Decoder = struct {
     ocl_pool: std.ArrayList(opencl.Staging) = .empty,
     ocl_queue_pool: std.ArrayList(opencl.Queue) = .empty,
     ocl_direct: bool = true,
-    // The SDK's output buffer usually forbids host reads (see opencl.zig);
-    // after the first CL_INVALID_OPERATION the direct path is pointless, so
-    // remember the rejection instead of retrying every frame.
+    // The SDK's output buffer usually forbids host reads (see opencl.zig).
+    // That rejection (CL_INVALID_OPERATION) is deterministic per buffer
+    // flags, so it permanently disables the direct path; transient copy
+    // failures fall back for the frame and retry, like the CUDA path.
     ocl_direct_broken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pinned_pool: std.ArrayList([]u8) = .empty,
     metal_pool: std.ArrayList(metal.Staging) = .empty,
@@ -700,8 +701,10 @@ pub const Decoder = struct {
     stream_pool: std.ArrayList(cuda.Stream) = .empty,
     reg_pool: std.ArrayList(usize) = .empty,
     reg_failed: std.ArrayList(usize) = .empty, // addresses cuMemHostRegister rejected
-    cuda_fast: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    cuda_slow: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    // direct-vs-fallback copy counters, shared by the CUDA and OpenCL paths
+    // (pipelines are mutually exclusive per decoder)
+    gpu_fast: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    gpu_slow: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     depth: formats.Depth,
     scale: Scale,
@@ -1210,6 +1213,15 @@ pub const Decoder = struct {
         };
     }
 
+    fn printDirectStats(self: *const Decoder, comptime label: []const u8) void {
+        const fast = self.gpu_fast.load(.monotonic);
+        const slow = self.gpu_slow.load(.monotonic);
+        if (fast + slow == 0) return;
+        std.debug.print("[" ++ label ++ "-direct] fast={d} fallback={d} ({d:.1}% fast)\n", .{
+            fast, slow, 100.0 * @as(f64, @floatFromInt(fast)) / @as(f64, @floatFromInt(fast + slow)),
+        });
+    }
+
     pub fn close(self: *Decoder) void {
         const gpa = self.gpa;
         self.codec.flushJobs();
@@ -1227,10 +1239,7 @@ pub const Decoder = struct {
             self.reg_failed.deinit(gpa);
             for (self.stream_pool.items) |s| ctx.destroyStream(s);
             self.stream_pool.deinit(gpa);
-            const fast = self.cuda_fast.load(.monotonic);
-            const slow = self.cuda_slow.load(.monotonic);
-            if (self.cuda_direct and fast + slow > 0 and envFlag("BRAW_CUDA_STATS", false))
-                std.debug.print("[cuda-direct] fast={d} fallback={d} ({d:.1}% fast)\n", .{ fast, slow, 100.0 * @as(f64, @floatFromInt(fast)) / @as(f64, @floatFromInt(fast + slow)) });
+            if (self.cuda_direct and envFlag("BRAW_CUDA_STATS", false)) self.printDirectStats("cuda");
         }
         if (self.metal_queue != null) {
             for (self.metal_pool.items) |stg| metal.destroyStaging(stg);
@@ -1241,10 +1250,7 @@ pub const Decoder = struct {
             self.ocl_pool.deinit(gpa);
             for (self.ocl_queue_pool.items) |q| ctx.destroyQueue(q);
             self.ocl_queue_pool.deinit(gpa);
-            const fast = self.cuda_fast.load(.monotonic);
-            const slow = self.cuda_slow.load(.monotonic);
-            if (self.ocl_direct and fast + slow > 0 and envFlag("BRAW_OCL_STATS", false))
-                std.debug.print("[ocl-direct] fast={d} fallback={d} ({d:.1}% fast)\n", .{ fast, slow, 100.0 * @as(f64, @floatFromInt(fast)) / @as(f64, @floatFromInt(fast + slow)) });
+            if (self.ocl_direct and envFlag("BRAW_OCL_STATS", false)) self.printDirectStats("ocl");
         }
         if (self.cuda_ctx) |*ctx| ctx.destroy();
         if (self.ocl_ctx) |*ctx| ctx.destroy();
@@ -1380,11 +1386,11 @@ pub const Decoder = struct {
             break :blk ctx.copyPlanesDtoHAsync(&planes, stream);
         } else ctx.copyPlanesDtoH(&planes);
         copy_result catch {
-            _ = self.cuda_slow.fetchAdd(1, .monotonic);
+            _ = self.gpu_slow.fetchAdd(1, .monotonic);
             self.cudaStagingCopy(req, dest, dev);
             return;
         };
-        _ = self.cuda_fast.fetchAdd(1, .monotonic);
+        _ = self.gpu_fast.fetchAdd(1, .monotonic);
     }
 
     /// Staging path: DtoH into a pooled pinned buffer (async on a pooled
@@ -1422,7 +1428,9 @@ pub const Decoder = struct {
     /// staging buffer, no CPU copy. The destination is not page-locked
     /// (OpenCL has no host-register API), but skipping the CPU plane copy
     /// still wins; falls back to the pinned-staging path on any failure.
-    /// Reuses the cuda_fast/cuda_slow counters (pipelines are exclusive).
+    /// HostAccessForbidden (deterministic per buffer flags) disables the
+    /// direct path for the rest of the decoder's life; other failures
+    /// retry next frame like the CUDA path.
     fn copyOclPlanesDirect(self: *Decoder, req: *Request, dest: *const formats.Dest, mem: opencl.Mem) void {
         const ctx = if (self.ocl_ctx) |*c| c else return;
         const plane_bytes: usize = @as(usize, req.pending.size) / 3;
@@ -1442,15 +1450,19 @@ pub const Decoder = struct {
                 .height = dest.height,
             };
         }
-        const queue = self.acquireOclQueue() orelse ctx.service_queue;
-        defer if (queue != ctx.service_queue) self.releaseOclQueue(queue);
-        ctx.copyPlanesToHost(queue, mem, &planes) catch {
-            _ = self.cuda_slow.fetchAdd(1, .monotonic);
-            self.ocl_direct_broken.store(true, .monotonic);
+        // release the queue before the staging fallback borrows its own
+        const copy_result = blk: {
+            const queue = self.acquireOclQueue() orelse ctx.service_queue;
+            defer if (queue != ctx.service_queue) self.releaseOclQueue(queue);
+            break :blk ctx.copyPlanesToHost(queue, mem, &planes);
+        };
+        copy_result catch |e| {
+            _ = self.gpu_slow.fetchAdd(1, .monotonic);
+            if (e == error.HostAccessForbidden) self.ocl_direct_broken.store(true, .monotonic);
             self.oclStagingCopy(req, dest, mem);
             return;
         };
-        _ = self.cuda_fast.fetchAdd(1, .monotonic);
+        _ = self.gpu_fast.fetchAdd(1, .monotonic);
     }
 
     /// Staging path: device-side clEnqueueCopyBuffer into a pooled pinned
