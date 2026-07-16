@@ -87,17 +87,31 @@ pub const OverrideError = error{
     KelvinOutOfRange,
     TintOutOfRange,
     IsoOutOfRange,
+    ExposureInvalid,
     ColorScienceOutOfRange,
 };
 
 /// Build FrameOverrides from raw host parameters with range validation —
-/// shared by both adapters so limits live in exactly one place.
+/// shared by both adapters so limits live in exactly one place. Domain
+/// checks happen here so bad values fail at open with a clear message,
+/// not at the first frame with a generic SDK hresult: kelvin/iso are
+/// 1-based (0 would be rejected by the SDK per frame), exposure must be
+/// finite (NaN/inf poison the processing attributes).
 pub fn frameOverridesFromParams(kelvin: ?i64, tint: ?i64, exposure: ?f64, iso: ?i64) OverrideError!FrameOverrides {
     var o: FrameOverrides = .{};
-    if (kelvin) |v| o.kelvin = std.math.cast(u32, v) orelse return error.KelvinOutOfRange;
+    if (kelvin) |v| {
+        if (v < 1) return error.KelvinOutOfRange;
+        o.kelvin = std.math.cast(u32, v) orelse return error.KelvinOutOfRange;
+    }
     if (tint) |v| o.tint = std.math.cast(i16, v) orelse return error.TintOutOfRange;
-    if (exposure) |v| o.exposure = @floatCast(v);
-    if (iso) |v| o.iso = std.math.cast(u32, v) orelse return error.IsoOutOfRange;
+    if (exposure) |v| {
+        if (!std.math.isFinite(v)) return error.ExposureInvalid;
+        o.exposure = @floatCast(v);
+    }
+    if (iso) |v| {
+        if (v < 1) return error.IsoOutOfRange;
+        o.iso = std.math.cast(u32, v) orelse return error.IsoOutOfRange;
+    }
     return o;
 }
 
@@ -804,7 +818,10 @@ pub const Decoder = struct {
             };
             defer api.release(cfg);
 
-            if (opts.threads > 0) _ = cfg.v.setCPUThreads(cfg, opts.threads);
+            if (opts.threads > 0 and cfg.v.setCPUThreads(cfg, opts.threads) != api.S_OK) {
+                err_detail.* = std.fmt.allocPrint(gpa, "the SDK rejected threads={d} (SetCPUThreads failed)", .{opts.threads}) catch null;
+                return error.CodecFailed;
+            }
 
             switch (opts.pipeline) {
                 .cpu => {},

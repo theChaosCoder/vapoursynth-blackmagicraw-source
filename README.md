@@ -66,7 +66,7 @@ Defaults decode "as shot": camera metadata plus an auto-applied
 `<clipname>.sidecar` next to the file (reported via the
 `BRAWSidecarAttached` prop; parameters override both).
 
-Frame props: `_DurationNum/Den`, `_AbsoluteTime`, `_Matrix`, `_Range`
+Frame props: `_DurationNum/Den`, `_AbsoluteTime`, `_Matrix`, `_Range` (AviSynth: `_ColorRange`)
 (+`_Transfer`/`_Primaries` when the gamma/gamut has a standard code), plus
 `BRAWTimecode`, `BRAWISO`, `BRAWWhiteBalanceKelvin/Tint`, `BRAWExposure`,
 camera/clip info as `BRAW*`. Inspect everything with

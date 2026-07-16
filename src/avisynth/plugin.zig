@@ -312,6 +312,7 @@ export fn bsrc_create_impl(env: ?*Env, args: *const Val, out: *Val, user_data: ?
                 error.KelvinOutOfRange => "BRAWSource: kelvin out of range",
                 error.TintOutOfRange => "BRAWSource: tint out of range",
                 error.IsoOutOfRange => "BRAWSource: iso out of range",
+                error.ExposureInvalid => "BRAWSource: exposure must be finite",
                 error.ColorScienceOutOfRange => "BRAWSource: colorscience out of range",
             };
         }
@@ -337,7 +338,10 @@ export fn bsrc_create_impl(env: ?*Env, args: *const Val, out: *Val, user_data: ?
     };
 
     const collect_all = asBool(argAt(args, arg_allmetaprops)) orelse false;
-    const threads: u32 = if (asInt(argAt(args, arg_threads))) |t| std.math.cast(u32, t) orelse 0 else 0;
+    const threads: u32 = if (asInt(argAt(args, arg_threads))) |t| std.math.cast(u32, t) orelse {
+        setErrorVal(env, out, "BRAWSource: threads must be >= 0");
+        return;
+    } else 0;
     const libpath = asStr(argAt(args, arg_libpath));
 
     var dir_buf: [4096]u8 = undefined;
@@ -425,6 +429,14 @@ export fn bsrc_create_impl(env: ?*Env, args: *const Val, out: *Val, user_data: ?
                 24 => c.AVS_SAMPLE_INT24,
                 else => c.AVS_SAMPLE_INT32,
             };
+        } else {
+            // don't silently deliver a video-only clip when the user asked
+            // for the audio track and it exists but we can't represent it
+            d.dec.close();
+            allocator.destroy(d);
+            api.release_clip(clip);
+            setErrorVal(env, out, "BRAWSource: unsupported audio bit depth (use audio=false to skip the audio track)");
+            return;
         }
     }
 

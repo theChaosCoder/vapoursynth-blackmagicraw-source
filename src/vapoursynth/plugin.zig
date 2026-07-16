@@ -104,8 +104,9 @@ fn sourceGetFrame(
     props.setDurationNum(d.fps.den);
     props.setDurationDen(d.fps.num);
     props.setMatrix(.RGB);
-    // modern range prop: 1 = full range (the deprecated _ColorRange alias
-    // is derived by the core)
+    // modern VS range prop: _Range, 1 = full range (the core derives the
+    // deprecated _ColorRange alias). The AviSynth adapter sets that host's
+    // own convention, _ColorRange = 0 (full), instead.
     props.setInt("_Range", 1, .Replace);
     props.setFieldBased(.PROGRESSIVE);
     // tag transfer/primaries when the effective gamma/gamut has a CICP code
@@ -187,6 +188,12 @@ fn audioGetFrame(
             return null;
         };
         if (res.samples == 0) break;
+        // the unpack below assumes tightly packed sample frames; a byte
+        // count that disagrees with the sample count would misalign them
+        if (res.bytes != res.samples * d.packed_bytes_per_sample_frame) {
+            zapi.setFilterError("braw.AudioSource: SDK returned inconsistent sample/byte counts");
+            return null;
+        }
         got += res.samples;
     }
     if (got < want) {
@@ -341,6 +348,7 @@ fn overrideErrorMsg(comptime fname: []const u8, e: core_mod.decoder.OverrideErro
         error.KelvinOutOfRange => fname ++ ": 'kelvin' out of range",
         error.TintOutOfRange => fname ++ ": 'tint' out of range",
         error.IsoOutOfRange => fname ++ ": 'iso' out of range",
+        error.ExposureInvalid => fname ++ ": 'exposure' must be finite",
         error.ColorScienceOutOfRange => fname ++ ": 'colorscience' out of range",
     };
 }
@@ -392,7 +400,10 @@ fn sourceCreate(in_map: ?*const vs.Map, out_map: ?*vs.Map, user_data: ?*anyopaqu
         return;
     };
 
-    const threads: u32 = if (map_in.getInt(i64, "threads")) |t| std.math.cast(u32, t) orelse 0 else 0;
+    const threads: u32 = if (map_in.getInt(i64, "threads")) |t| std.math.cast(u32, t) orelse {
+        map_out.setError("braw.Source: 'threads' must be >= 0");
+        return;
+    } else 0;
     const collect_all = map_in.getBool("allmetaprops") orelse false;
     const libpath = map_in.getData("libpath", 0);
 
