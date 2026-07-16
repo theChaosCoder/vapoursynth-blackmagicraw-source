@@ -24,7 +24,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vapoursynth-brawsource"
-version = "0.3.1"
+version = "0.4.0"
 description = "Blackmagic RAW (.braw) source plugin for VapourSynth — batteries included (bundles the Blackmagic RAW runtime)"
 readme = "README.md"
 requires-python = ">=3.9"
