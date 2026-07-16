@@ -282,25 +282,25 @@ def test_plugin_dir_deps_discovery():
           f"plugin-dir deps discovery (stderr: {res.stderr.strip()[:300]})")
 
 
-def test_cuda_pipeline():
-    """CUDA decode must produce a visually identical image to the CPU path.
+def gpu_pipeline_check(pipeline):
+    """GPU decode must produce a visually identical image to the CPU path.
 
     GPU and CPU rounding differ slightly (like Windows vs Linux), so this
-    asserts a small bound, not byte-equality. Skipped when no CUDA device.
+    asserts a small bound, not byte-equality. Skipped when no such device.
     """
     import array
 
     try:
-        gpu = open_clip(PORTRAIT, pipeline="cuda")
+        gpu = open_clip(PORTRAIT, pipeline=pipeline)
         gf = gpu.get_frame(0)
     except vs.Error as e:
-        if "CUDA" in str(e) or "unavailable" in str(e).lower():
-            print("  SKIP: no CUDA device")
+        if pipeline.upper() in str(e).upper() or "unavailable" in str(e).lower():
+            print(f"  SKIP: no {pipeline} device")
             return
         raise
 
     cf = open_clip(PORTRAIT, pipeline="cpu").get_frame(0)
-    check(gpu.format.id == vs.RGB48, "cuda -> RGB48")
+    check(gpu.format.id == vs.RGB48, f"{pipeline} -> RGB48")
     maxdiff = 0
     for p in range(3):
         a = array.array("H"); a.frombytes(bytes(cf[p]))
@@ -310,10 +310,18 @@ def test_cuda_pipeline():
             if d > maxdiff:
                 maxdiff = d
     # GPU vs CPU color science: well under 1% of the 16-bit range
-    check(maxdiff < 655, f"cuda vs cpu max diff {maxdiff} < 655 (1%)")
+    check(maxdiff < 655, f"{pipeline} vs cpu max diff {maxdiff} < 655 (1%)")
     # determinism on the GPU path too
     check(frame_digest(gpu.get_frame(0)) == frame_digest(gpu.get_frame(0)),
-          "cuda determinism")
+          f"{pipeline} determinism")
+
+
+def test_cuda_pipeline():
+    gpu_pipeline_check("cuda")
+
+
+def test_opencl_pipeline():
+    gpu_pipeline_check("opencl")
 
 
 def test_errors():
@@ -345,7 +353,8 @@ def main():
         print("SKIP: SDK sample/runtime missing (run tools/extract-sdk.sh)")
         skipped += 1
     if PORTRAIT.exists() and LIBPATH.exists():
-        tests += [test_portrait_ntsc_and_random_access, test_cuda_pipeline]
+        tests += [test_portrait_ntsc_and_random_access, test_cuda_pipeline,
+                  test_opencl_pipeline]
     else:
         print("SKIP: Portrait sample missing (run tools/extract-sdk.sh --samples)")
         skipped += 1

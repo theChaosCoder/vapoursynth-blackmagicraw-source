@@ -4,9 +4,10 @@
 Requests every frame through VapourSynth's threaded prefetch (real plugin
 usage: several decodeFrame calls run concurrently, so the SDK has jobs in
 flight). Sweeps VS thread counts and reports fps per pipeline. The GPU
-pipeline is picked per platform: CUDA on Linux/Windows, Metal on macOS.
+pipeline is picked per platform: CUDA on Linux/Windows, Metal on macOS —
+or forced with the second argument (e.g. `opencl`).
 
-    encode_test/.venv/bin/python test/bench/bench_vs.py [clip.braw]
+    encode_test/.venv/bin/python test/bench/bench_vs.py [clip.braw] [pipeline]
 """
 import sys
 import time
@@ -33,6 +34,8 @@ core = vs.core
 core.std.LoadPlugin(path=str(PLUGIN))
 
 clip_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CLIP
+if len(sys.argv) > 2:
+    GPU_PIPELINE = sys.argv[2]
 LOOPS = 4  # lengthen the clip for a stable measurement
 
 

@@ -1,8 +1,9 @@
 # GPU decoding — implementation & benchmarks
 
-The `gpu-cuda` branch adds a `pipeline` option to `braw.Source`:
-`cuda` (NVIDIA, Linux/Windows) and `metal` (Apple GPU, macOS) decode on the
-GPU via the Blackmagic RAW SDK's respective pipelines instead of the CPU.
+The `pipeline` option of `braw.Source` selects the decode backend:
+`cuda` (NVIDIA, Linux/Windows), `metal` (Apple GPU, macOS) and `opencl`
+(any OpenCL GPU — the option for AMD/Intel) decode on the GPU via the
+Blackmagic RAW SDK's respective pipelines instead of the CPU.
 
 Correctness is verified on both: a GPU-decoded frame matches the CPU decode
 to within <0.6 % of the 16-bit range (GPU vs CPU rounding, the same order of
@@ -27,6 +28,18 @@ on an RTX 3080 (Ryzen 5 9600X, PCIe gen4 x16), Metal on an Apple M1 Pro
   staging buffer's contents pointer straight into the plane copy — no
   intermediate host copy. The Objective-C runtime is dlopened, so the plugin
   still cross-compiles from Linux without a macOS SDK.
+- **OpenCL**: the SDK creates the device and its `cl_context`/
+  `cl_command_queue` (`CreatePipelineDeviceIterator(OpenCL, InteropNone)` →
+  `CreateDevice` → `SetFromDevice`); `src/core/braw/opencl.zig` dlopens
+  `libOpenCL.so.1`/`OpenCL.dll` and adopts that context for readback. The
+  SDK's output `cl_mem` forbids host access (`clEnqueueReadBuffer*` fails
+  with `CL_INVALID_OPERATION`), so the readback mirrors the Metal pattern:
+  a device-side `clEnqueueCopyBuffer` into a pooled pinned
+  (`CL_MEM_ALLOC_HOST_PTR`) staging buffer, a zero-copy blocking map, then
+  the shared plane copy. Transfers run on pooled queues separate from the
+  SDK's in-order decode queue, so they overlap the decode of the next
+  frame. A direct `clEnqueueReadBufferRect`-into-frame path is attempted
+  once per decoder in case a driver allows host reads on the SDK buffer.
 
 ## Results — Metal (Apple M1 Pro, unified memory)
 
@@ -100,6 +113,25 @@ copy, see below — the same clips measured 74/100 (1.35×) at 4.6K, 242/209
 pipelines together — CUDA 1.35×→1.63× at 4.6K, and from a loss to a small
 win at half-res — but the memory-bound 6K case stays at parity. The raw 5×
 standalone decode remains the upper bound.)*
+
+## Results — OpenCL (RTX 3080 via NVIDIA's OpenCL ICD)
+
+Measured with the same interleaved in-plugin methodology (4.6K u16 clip,
+6 VS threads, best of 2 rounds; CUDA on the same day/machine for a fair
+in-run baseline):
+
+| pipeline | fps |
+|---|---|
+| CPU | ~107 |
+| OpenCL | ~176 (**1.6×**) |
+| CUDA | ~324 (3.0×) |
+
+OpenCL is decode-bound, not readback-bound: at `scale=2` it reaches
+~353 fps (only 2× despite 4× fewer pixels), and f16 output (half the
+transfer size) changes nothing (~166 fps) — the `libDecoderOpenCL` kernels
+are simply slower than the CUDA ones. On NVIDIA hardware `cuda` remains the
+right choice; `opencl` is for GPUs that have no native pipeline (AMD,
+Intel), where ~1.6× over CPU comes essentially for free.
 
 ## How the plugin keeps up (two fixes)
 

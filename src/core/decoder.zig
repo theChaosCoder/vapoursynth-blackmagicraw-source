@@ -23,6 +23,7 @@ const variant = @import("braw/variant.zig");
 const loader = @import("braw/loader.zig");
 const cuda = @import("braw/cuda.zig");
 const metal = @import("braw/metal.zig");
+const opencl = @import("braw/opencl.zig");
 const formats = @import("formats.zig");
 const meta = @import("meta.zig");
 const sync = @import("sync.zig");
@@ -121,11 +122,13 @@ pub const Pipeline = enum {
     cpu,
     cuda, // NVIDIA (Linux/Windows)
     metal, // Apple GPU (macOS)
+    opencl, // any OpenCL GPU (AMD/Intel/NVIDIA)
 
     pub fn parse(s: []const u8) ?Pipeline {
         if (std.ascii.eqlIgnoreCase(s, "cpu")) return .cpu;
         if (std.ascii.eqlIgnoreCase(s, "cuda")) return .cuda;
         if (std.ascii.eqlIgnoreCase(s, "metal")) return .metal;
+        if (std.ascii.eqlIgnoreCase(s, "opencl")) return .opencl;
         return null;
     }
 };
@@ -237,12 +240,13 @@ fn envFlag(name: [:0]const u8, default: bool) bool {
     };
 }
 
-/// Formats the CUDA-direct DtoH-into-frame path can handle: three equal-size,
-/// tightly-packed device planes copied verbatim (no de-interleave, no bit-depth
-/// conversion). u16/f16 planar always qualify; f32 planar qualifies unless the
-/// destination is f16 (that narrowing needs a CPU pass). The interleaved RGBA
-/// formats need a CPU de-interleave, so they keep the staging path.
-fn cudaDirectEligible(fmt: api.ResourceFormat, dst_depth: formats.Depth) bool {
+/// Formats the direct DtoH-into-frame path (CUDA and OpenCL) can handle:
+/// three equal-size, tightly-packed device planes copied verbatim (no
+/// de-interleave, no bit-depth conversion). u16/f16 planar always qualify;
+/// f32 planar qualifies unless the destination is f16 (that narrowing needs
+/// a CPU pass). The interleaved RGBA formats need a CPU de-interleave, so
+/// they keep the staging path.
+fn directCopyEligible(fmt: api.ResourceFormat, dst_depth: formats.Depth) bool {
     return switch (fmt) {
         .rgb_u16_planar, .rgb_f16_planar => true,
         .rgb_f32_planar => dst_depth == .f32_,
@@ -259,6 +263,7 @@ const Pending = struct {
     host_src: ?[*]const u8 = null,
     size: u32 = 0,
     cuda_dev: ?usize = null, // CUDA: device pointer of the decoded image
+    ocl_mem: ?opencl.Mem = null, // OpenCL: cl_mem of the decoded image (owned by `image`)
     mtl_staging: ?metal.Staging = null,
     mtl_cmdbuf: ?*anyopaque = null, // in-flight blit; finishBlit before touching staging
 };
@@ -436,6 +441,13 @@ fn cbProcessComplete(_: *anyopaque, job: *api.IBlackmagicRawJob, hr: api.HRESULT
         api.addRef(image);
         req.pending.image = image;
         req.pending.cuda_dev = @intFromPtr(resource.?);
+    } else if (req.decoder.ocl_ctx != null) {
+        // Same deal as CUDA: the resource is a cl_mem owned by the image;
+        // retain the image and let finishRequest do the readback off the
+        // serial callback thread.
+        api.addRef(image);
+        req.pending.image = image;
+        req.pending.ocl_mem = resource.?;
     } else if (req.decoder.metal_queue) |queue| {
         const stg = req.decoder.acquireMetalStaging(size_bytes) catch {
             req.oom = true;
@@ -657,10 +669,22 @@ pub const Decoder = struct {
     // Metal: the SDK pipeline device, whose MTLCommandQueue drives the blit
     // readback into a pool of managed staging MTLBuffers (a full-res frame
     // is tens of MB; allocating one per frame is slow).
+    // OpenCL: the SDK pipeline device's cl_context, plus pools of readback
+    // queues (transfers must not ride the SDK's in-order decode queue) and
+    // pinned staging buffers.
     pipeline: Pipeline,
     cuda_ctx: ?cuda.Context = null,
     metal_device: ?*api.IBlackmagicRawPipelineDevice = null,
     metal_queue: ?*anyopaque = null,
+    ocl_ctx: ?opencl.Context = null,
+    ocl_device: ?*api.IBlackmagicRawPipelineDevice = null,
+    ocl_pool: std.ArrayList(opencl.Staging) = .empty,
+    ocl_queue_pool: std.ArrayList(opencl.Queue) = .empty,
+    ocl_direct: bool = true,
+    // The SDK's output buffer usually forbids host reads (see opencl.zig);
+    // after the first CL_INVALID_OPERATION the direct path is pointless, so
+    // remember the rejection instead of retrying every frame.
+    ocl_direct_broken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pinned_pool: std.ArrayList([]u8) = .empty,
     metal_pool: std.ArrayList(metal.Staging) = .empty,
     pinned_mutex: sync.Mutex = .{},
@@ -730,6 +754,7 @@ pub const Decoder = struct {
             .cuda_direct = envFlag("BRAW_CUDA_DIRECT", true),
             .cuda_pin = envFlag("BRAW_CUDA_PIN", true),
             .cuda_stream = envFlag("BRAW_CUDA_STREAM", true),
+            .ocl_direct = envFlag("BRAW_OCL_DIRECT", true),
             // provisional when depth is auto; finalized in collectClipInfo
             // once the effective gamma is known
             .depth = opts.depth orelse .u16_,
@@ -753,6 +778,8 @@ pub const Decoder = struct {
         }
         errdefer if (self.cuda_ctx) |*ctx| ctx.destroy();
         errdefer if (self.metal_device) |d| api.release(d);
+        errdefer if (self.ocl_ctx) |*ctx| ctx.destroy();
+        errdefer if (self.ocl_device) |d| api.release(d);
 
         // configuration is read at the first OpenClip, so pipeline + threads
         // must be set beforehand
@@ -784,6 +811,9 @@ pub const Decoder = struct {
                 },
                 .metal => {
                     try self.setupMetal(cfg, err_detail);
+                },
+                .opencl => {
+                    try self.setupOpenCl(cfg, err_detail);
                 },
             }
         }
@@ -1027,6 +1057,52 @@ pub const Decoder = struct {
         self.metal_queue = queue_out;
     }
 
+    // --- OpenCL pipeline setup ---
+
+    fn setupOpenCl(self: *Decoder, cfg: *api.IBlackmagicRawConfiguration, err_detail: *?[]u8) OpenError!void {
+        const gpa = self.gpa;
+        if (!opencl.available()) {
+            err_detail.* = std.fmt.allocPrint(gpa, "OpenCL pipeline requested but the OpenCL runtime (libOpenCL) could not be loaded", .{}) catch null;
+            return error.GpuUnavailable;
+        }
+        var supported = false;
+        _ = cfg.v.isPipelineSupported(cfg, .opencl, &supported);
+        if (!supported) {
+            err_detail.* = std.fmt.allocPrint(gpa, "the BlackmagicRaw OpenCL decoder is not available (libDecoderOpenCL missing?)", .{}) catch null;
+            return error.PipelineUnsupported;
+        }
+        // let the SDK pick the device and create the cl_context/cl_command_queue
+        var iter_opt: ?*api.IBlackmagicRawPipelineDeviceIterator = null;
+        if (self.factory.v.createPipelineDeviceIterator(self.factory, .opencl, .none, &iter_opt) != api.S_OK or iter_opt == null) {
+            err_detail.* = std.fmt.allocPrint(gpa, "no OpenCL device available to the BlackmagicRaw SDK", .{}) catch null;
+            return error.PipelineUnsupported;
+        }
+        const iter = iter_opt.?;
+        defer api.release(iter);
+
+        var dev_opt: ?*api.IBlackmagicRawPipelineDevice = null;
+        if (iter.v.createDevice(iter, &dev_opt) != api.S_OK or dev_opt == null) {
+            err_detail.* = std.fmt.allocPrint(gpa, "no OpenCL device available to the BlackmagicRaw SDK", .{}) catch null;
+            return error.PipelineUnsupported;
+        }
+        self.ocl_device = dev_opt.?;
+
+        if (cfg.v.setFromDevice(cfg, self.ocl_device.?) != api.S_OK) {
+            return error.PipelineUnsupported;
+        }
+        // adopt the context/device behind the SDK's queue for our readback queues
+        var pl: api.Pipeline = .opencl;
+        var ctx_out: ?*anyopaque = null;
+        var queue_out: ?*anyopaque = null;
+        if (self.ocl_device.?.v.getPipeline(self.ocl_device.?, &pl, &ctx_out, &queue_out) != api.S_OK or queue_out == null) {
+            return error.PipelineUnsupported;
+        }
+        self.ocl_ctx = opencl.Context.fromSdkQueue(queue_out.?) catch |e| {
+            err_detail.* = std.fmt.allocPrint(gpa, "OpenCL readback setup failed: {s}", .{@errorName(e)}) catch null;
+            return error.GpuUnavailable;
+        };
+    }
+
     // --- staging pools (GPU readback) ---
     // CUDA pools pinned host buffers (faster DtoH, pinned alloc is slow);
     // Metal pools managed MTLBuffers (blit destination, read in place).
@@ -1078,6 +1154,44 @@ pub const Decoder = struct {
         };
     }
 
+    /// Borrow a readback queue from the pool (creating one on demand).
+    /// Returns null if creation fails, in which case the caller falls back
+    /// to the context's service queue.
+    fn acquireOclQueue(self: *Decoder) ?opencl.Queue {
+        const ctx = if (self.ocl_ctx) |*c| c else return null;
+        self.pinned_mutex.lock();
+        defer self.pinned_mutex.unlock();
+        if (self.ocl_queue_pool.pop()) |q| return q;
+        return ctx.createQueue() catch null;
+    }
+
+    fn releaseOclQueue(self: *Decoder, q: opencl.Queue) void {
+        self.pinned_mutex.lock();
+        defer self.pinned_mutex.unlock();
+        self.ocl_queue_pool.append(self.gpa, q) catch {
+            if (self.ocl_ctx) |*ctx| ctx.destroyQueue(q);
+        };
+    }
+
+    fn acquireOclStaging(self: *Decoder, size: u32) !opencl.Staging {
+        const ctx = if (self.ocl_ctx) |*c| c else return error.OutOfMemory;
+        self.pinned_mutex.lock();
+        defer self.pinned_mutex.unlock();
+        while (self.ocl_pool.pop()) |stg| {
+            if (stg.len >= size) return stg;
+            ctx.destroyStaging(stg); // stale (smaller) buffer; drop it
+        }
+        return ctx.createStaging(size) catch error.OutOfMemory;
+    }
+
+    fn releaseOclStaging(self: *Decoder, stg: opencl.Staging) void {
+        self.pinned_mutex.lock();
+        defer self.pinned_mutex.unlock();
+        self.ocl_pool.append(self.gpa, stg) catch {
+            if (self.ocl_ctx) |*ctx| ctx.destroyStaging(stg);
+        };
+    }
+
     fn acquireMetalStaging(self: *Decoder, size: u32) !metal.Staging {
         self.pinned_mutex.lock();
         defer self.pinned_mutex.unlock();
@@ -1122,8 +1236,20 @@ pub const Decoder = struct {
             for (self.metal_pool.items) |stg| metal.destroyStaging(stg);
             self.metal_pool.deinit(gpa);
         }
+        if (self.ocl_ctx) |*ctx| {
+            for (self.ocl_pool.items) |stg| ctx.destroyStaging(stg);
+            self.ocl_pool.deinit(gpa);
+            for (self.ocl_queue_pool.items) |q| ctx.destroyQueue(q);
+            self.ocl_queue_pool.deinit(gpa);
+            const fast = self.cuda_fast.load(.monotonic);
+            const slow = self.cuda_slow.load(.monotonic);
+            if (self.ocl_direct and fast + slow > 0 and envFlag("BRAW_OCL_STATS", false))
+                std.debug.print("[ocl-direct] fast={d} fallback={d} ({d:.1}% fast)\n", .{ fast, slow, 100.0 * @as(f64, @floatFromInt(fast)) / @as(f64, @floatFromInt(fast + slow)) });
+        }
         if (self.cuda_ctx) |*ctx| ctx.destroy();
+        if (self.ocl_ctx) |*ctx| ctx.destroy();
         if (self.metal_device) |d| api.release(d);
+        if (self.ocl_device) |d| api.release(d);
         api.release(self.factory);
         loader.release(self.lib);
         if (self.camera_type.len > 0) gpa.free(self.camera_type);
@@ -1185,10 +1311,23 @@ pub const Decoder = struct {
         // the frame plane (no staging buffer, no CPU copy), or stage through
         // a pinned buffer for formats that need CPU conversion.
         if (p.cuda_dev) |dev| {
-            if (self.cuda_direct and cudaDirectEligible(req.resource_format, self.depth)) {
+            if (self.cuda_direct and directCopyEligible(req.resource_format, self.depth)) {
                 self.copyCudaPlanesDirect(req, dest, dev);
             } else {
                 self.cudaStagingCopy(req, dest, dev);
+            }
+            return;
+        }
+
+        // OpenCL: same split as CUDA — ReadBufferRect straight into the
+        // frame planes for the planar formats, pinned staging otherwise.
+        if (p.ocl_mem) |mem| {
+            if (self.ocl_direct and !self.ocl_direct_broken.load(.monotonic) and
+                directCopyEligible(req.resource_format, self.depth))
+            {
+                self.copyOclPlanesDirect(req, dest, mem);
+            } else {
+                self.oclStagingCopy(req, dest, mem);
             }
             return;
         }
@@ -1271,6 +1410,69 @@ pub const Decoder = struct {
             return;
         };
         formats.copyImage(req.resource_format, buf.ptr, size, dest, self.depth) catch |e| {
+            req.fail(api.E_FAIL, switch (e) {
+                error.SizeMismatch => "resource size mismatch (padded buffer?)",
+                error.UnsupportedFormat => "unsupported resource format",
+            });
+        };
+    }
+
+    /// Read the three tightly-packed device planes straight into the frame
+    /// planes via clEnqueueReadBufferRect on a pooled readback queue — no
+    /// staging buffer, no CPU copy. The destination is not page-locked
+    /// (OpenCL has no host-register API), but skipping the CPU plane copy
+    /// still wins; falls back to the pinned-staging path on any failure.
+    /// Reuses the cuda_fast/cuda_slow counters (pipelines are exclusive).
+    fn copyOclPlanesDirect(self: *Decoder, req: *Request, dest: *const formats.Dest, mem: opencl.Mem) void {
+        const ctx = if (self.ocl_ctx) |*c| c else return;
+        const plane_bytes: usize = @as(usize, req.pending.size) / 3;
+        const wbytes = plane_bytes / dest.height;
+        var planes: [3]opencl.PlaneCopy = undefined;
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            const dp = dest.planes[i] orelse {
+                req.fail(api.E_FAIL, "missing destination plane");
+                return;
+            };
+            planes[i] = .{
+                .dst = dp,
+                .dst_pitch = dest.strides[i],
+                .origin_y = i * dest.height,
+                .width_bytes = wbytes,
+                .height = dest.height,
+            };
+        }
+        const queue = self.acquireOclQueue() orelse ctx.service_queue;
+        defer if (queue != ctx.service_queue) self.releaseOclQueue(queue);
+        ctx.copyPlanesToHost(queue, mem, &planes) catch {
+            _ = self.cuda_slow.fetchAdd(1, .monotonic);
+            self.ocl_direct_broken.store(true, .monotonic);
+            self.oclStagingCopy(req, dest, mem);
+            return;
+        };
+        _ = self.cuda_fast.fetchAdd(1, .monotonic);
+    }
+
+    /// Staging path: device-side clEnqueueCopyBuffer into a pooled pinned
+    /// buffer (the SDK's buffer forbids host reads), blocking map, CPU plane
+    /// copy/de-interleave, unmap. All on a pooled queue so the copy overlaps
+    /// the SDK's decode work on its own queue.
+    fn oclStagingCopy(self: *Decoder, req: *Request, dest: *const formats.Dest, mem: opencl.Mem) void {
+        const ctx = if (self.ocl_ctx) |*c| c else return;
+        const size = req.pending.size;
+        const stg = self.acquireOclStaging(size) catch {
+            req.oom = true;
+            return;
+        };
+        defer self.releaseOclStaging(stg);
+        const queue = self.acquireOclQueue() orelse ctx.service_queue;
+        defer if (queue != ctx.service_queue) self.releaseOclQueue(queue);
+        const src = ctx.stageAndMap(queue, mem, stg, size) catch {
+            req.fail(api.E_FAIL, "GPU readback (clEnqueueCopyBuffer/Map)");
+            return;
+        };
+        defer ctx.unmapStaging(queue, stg, src);
+        formats.copyImage(req.resource_format, src, size, dest, self.depth) catch |e| {
             req.fail(api.E_FAIL, switch (e) {
                 error.SizeMismatch => "resource size mismatch (padded buffer?)",
                 error.UnsupportedFormat => "unsupported resource format",
